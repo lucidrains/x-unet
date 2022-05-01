@@ -69,6 +69,7 @@ class XUnet(nn.Module):
     def __init__(
         self,
         dim,
+        init_dim = None,
         out_dim = None,
         dim_mults=(1, 2, 4, 8),
         channels = 3
@@ -76,7 +77,10 @@ class XUnet(nn.Module):
         super().__init__()
         self.channels = channels
 
-        dims = [channels, *map(lambda m: dim * m, dim_mults)]
+        init_dim = default(init_dim, dim)
+        self.init_conv = nn.Conv3d(channels, init_dim, (1, 7, 7), padding = (0, 3, 3))
+
+        dims = [init_dim, *map(lambda m: dim * m, dim_mults)]
         in_out = list(zip(dims[:-1], dims[1:]))
 
         self.downs = nn.ModuleList([])
@@ -118,6 +122,8 @@ class XUnet(nn.Module):
         is_image = x.ndim == 4
         if is_image:
             x = rearrange(x, 'b c h w -> b c 1 h w')
+
+        x = self.init_conv(x)
 
         h = []
 
