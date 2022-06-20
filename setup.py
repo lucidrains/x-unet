@@ -6,6 +6,7 @@ setup(
   version = '0.0.2',
   license='MIT',
   description = 'X-Unet',
+  long_description_content_type = 'text/markdown',
   author = 'Phil Wang',
   author_email = 'lucidrains@gmail.com',
   url = 'https://github.com/lucidrains/x-unet',
