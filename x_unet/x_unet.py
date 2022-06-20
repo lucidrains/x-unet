@@ -103,7 +103,7 @@ class XUnet(nn.Module):
         mid_dim = dims[-1]
         self.mid = conv_next(mid_dim, mid_dim)
 
-        for ind, (dim_in, dim_out) in enumerate(reversed(in_out[1:])):
+        for ind, (dim_in, dim_out) in enumerate(reversed(in_out)):
             is_last = ind >= (num_resolutions - 1)
 
             self.ups.append(nn.ModuleList([
@@ -114,8 +114,8 @@ class XUnet(nn.Module):
 
         out_dim = default(out_dim, channels)
         self.final_conv = nn.Sequential(
-            ConvNextBlock(dim, dim),
-            nn.Conv3d(dim, out_dim, 1)
+            ConvNextBlock(dim * 2, dim),
+            nn.Conv3d(dim, out_dim, 3, padding = 1)
         )
 
     def forward(self, x):
@@ -124,6 +124,7 @@ class XUnet(nn.Module):
             x = rearrange(x, 'b c h w -> b c 1 h w')
 
         x = self.init_conv(x)
+        r = x.clone()
 
         h = []
 
@@ -141,6 +142,7 @@ class XUnet(nn.Module):
             x = convnext2(x)
             x = upsample(x)
 
+        x = torch.cat((x, r), dim = 1)
         out = self.final_conv(x)
 
         if is_image:
