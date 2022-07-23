@@ -194,6 +194,7 @@ class NestedResidualUnet(nn.Module):
     ):
         super().__init__()
 
+        self.depth = depth
         self.downs = nn.ModuleList([])
         self.ups = nn.ModuleList([])
 
@@ -226,7 +227,10 @@ class NestedResidualUnet(nn.Module):
 
     def forward(self, x):
         *_, h, w = x.shape
-        assert is_power_two(h) and is_power_two(w)
+
+        assert h == w, 'only works with square images'
+        assert is_power_two(h), 'height and width must be power of two'
+        assert (h % (2 ** self.depth)) == 0, 'the unet has too much depth for the image being passed in'
 
         if self.add_residual:
             residual = x.clone()
