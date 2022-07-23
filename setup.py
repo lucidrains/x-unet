@@ -3,7 +3,7 @@ from setuptools import setup, find_packages
 setup(
   name = 'x-unet',
   packages = find_packages(exclude=[]),
-  version = '0.0.2',
+  version = '0.0.3',
   license='MIT',
   description = 'X-Unet',
   long_description_content_type = 'text/markdown',
@@ -13,7 +13,9 @@ setup(
   keywords = [
     'artificial intelligence',
     'deep learning',
-    'unets'
+    'biomedical segmentation',
+    'medical deep learning',
+    'unets',
   ],
   install_requires=[
     'einops>=0.4',
