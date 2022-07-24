@@ -22,11 +22,11 @@ def l2norm(t):
 
 # helper classes
 
-def Upsample(dim):
-    return nn.ConvTranspose3d(dim, dim, (1, 4, 4), (1, 2, 2), (0, 1, 1))
+def Upsample(dim, dim_out):
+    return nn.ConvTranspose3d(dim, dim_out, (1, 4, 4), (1, 2, 2), (0, 1, 1))
 
-def Downsample(dim):
-    return nn.Conv3d(dim, dim, (1, 4, 4), (1, 2, 2), (0, 1, 1))
+def Downsample(dim, dim_out):
+    return nn.Conv3d(dim, dim_out, (1, 4, 4), (1, 2, 2), (0, 1, 1))
 
 # normalization
 
@@ -133,6 +133,50 @@ class Attention(nn.Module):
         out = rearrange(out, 'b h (f x y) d -> b (h d) f x y', f = f, x = h, y = w)
         return self.to_out(out)
 
+class FeatureMapConsolidator(nn.Module):
+    def __init__(
+        self,
+        dim,
+        *,
+        dim_ins = tuple(),
+        dim_outs = tuple(),
+        resize_fmap_before = True,
+        conv_block_fn = None
+    ):
+        super().__init__()
+        assert len(dim_ins) == len(dim_outs)
+        block_fn = default(conv_block_fn, Block)
+
+        self.fmap_convs = nn.ModuleList([block_fn(dim_in, dim_out) for dim_in, dim_out in zip(dim_ins, dim_outs)])
+        self.resize_fmap_before = resize_fmap_before
+
+        self.final_dim_out = dim + (sum(dim_outs) if len(dim_outs) > 0 else 0)
+
+    def resize_fmaps(self, fmaps, target_size):
+        return [F.interpolate(fmap, (fmap.shape[-3], target_size, target_size)) for fmap in fmaps]
+
+    def forward(self, x, fmaps = None):
+        target_size = x.shape[-1]
+
+        fmaps = default(fmaps, tuple())
+
+        assert len(fmaps) == len(self.fmap_convs)
+
+        if len(fmaps) == 0:
+            return x
+
+        if self.resize_fmap_before:
+            fmaps = self.resize_fmaps(fmaps, target_size)
+
+        outs = []
+        for fmap, conv in zip(fmaps, self.fmap_convs):
+            outs.append(conv(fmap))
+
+        if self.resize_fmap_before:
+            outs = self.resize_fmaps(outs, target_size)
+
+        return torch.cat((x, *outs), dim = 1)
+
 # unet
 
 class XUnet(nn.Module):
@@ -144,7 +188,8 @@ class XUnet(nn.Module):
         dim_mults = (1, 2, 4, 8),
         channels = 3,
         use_convnext = False,
-        resnet_groups = 8
+        resnet_groups = 8,
+        consolidate_upsample_fmaps = True
     ):
         super().__init__()
         self.channels = channels
@@ -166,33 +211,50 @@ class XUnet(nn.Module):
 
         # modules for all layers
 
+        skip_dims = []
+
         for ind, (dim_in, dim_out) in enumerate(in_out):
             is_last = ind >= (num_resolutions - 1)
+            skip_dims.append(dim_in)
 
             self.downs.append(nn.ModuleList([
-                blocks(dim_in, dim_out),
-                blocks(dim_out, dim_out),
-                Downsample(dim_out) if not is_last else nn.Identity()
+                blocks(dim_in, dim_in),
+                blocks(dim_in, dim_in),
+                Downsample(dim_in, dim_out)
             ]))
 
         mid_dim = dims[-1]
         self.mid = blocks(mid_dim, mid_dim)
         self.mid_attn = Attention(mid_dim)
+        self.mid_after = blocks(mid_dim, mid_dim)
+        self.mid_upsample = Upsample(mid_dim, dims[-2])
 
-        for ind, (dim_in, dim_out) in enumerate(reversed(in_out)):
+        for ind, (dim_in, dim_out) in enumerate(reversed(in_out[:-1])):
             is_last = ind >= (num_resolutions - 1)
 
             self.ups.append(nn.ModuleList([
-                blocks(dim_out * 2, dim_in),
-                blocks(dim_in, dim_in),
-                Upsample(dim_in) if not is_last else nn.Identity()
+                blocks(dim_out + skip_dims.pop(), dim_out),
+                blocks(dim_out, dim_out),
+                Upsample(dim_out, dim_in) if not is_last else nn.Identity()
             ]))
 
 
         out_dim = default(out_dim, channels)
 
+        if consolidate_upsample_fmaps:
+            self.consolidator = FeatureMapConsolidator(
+                dim,
+                dim_ins = tuple(map(lambda m: dim * m, dim_mults)),
+                dim_outs = (dim,) * len(dim_mults),
+                conv_block_fn = blocks
+            )
+        else:
+            self.consolidator = FeatureMapConsolidator(dim = dim)
+
+        final_dim_in = self.consolidator.final_dim_out
+
         self.final_conv = nn.Sequential(
-            blocks(dim * 2, dim),
+            blocks(final_dim_in + dim, dim),
             nn.Conv3d(dim, out_dim, 3, padding = 1)
         )
 
@@ -204,22 +266,31 @@ class XUnet(nn.Module):
         x = self.init_conv(x)
         r = x.clone()
 
-        h = []
+        down_hiddens = []
+        up_hiddens = []
 
         for block, block2, downsample in self.downs:
             x = block(x)
             x = block2(x)
-            h.append(x)
+            down_hiddens.append(x)
             x = downsample(x)
 
         x = self.mid(x)
         x = self.mid_attn(x) + x
+        x = self.mid_after(x)
+
+        up_hiddens.append(x)
+        x = self.mid_upsample(x)
+
 
         for block, block2, upsample in self.ups:
-            x = torch.cat((x, h.pop()), dim=1)
+            x = torch.cat((x, down_hiddens.pop()), dim=1)
             x = block(x)
             x = block2(x)
+            up_hiddens.insert(0, x)
             x = upsample(x)
+
+        x = self.consolidator(x, up_hiddens)
 
         x = torch.cat((x, r), dim = 1)
         out = self.final_conv(x)
@@ -232,24 +303,30 @@ class XUnet(nn.Module):
 # RSU
 
 class PixelShuffleUpsample2D(nn.Module):
-    def __init__(self, dim, dim_out = None):
+    def __init__(
+        self,
+        dim,
+        dim_out = None,
+        scale_factor = 2
+    ):
         super().__init__()
+        self.scale_squared = scale_factor ** 2
         dim_out = default(dim_out, dim)
-        conv = nn.Conv2d(dim, dim_out * 4, 1)
+        conv = nn.Conv2d(dim, dim_out * self.scale_squared, 1)
 
         self.net = nn.Sequential(
             conv,
             nn.SiLU(),
-            nn.PixelShuffle(2)
+            nn.PixelShuffle(scale_factor)
         )
 
         self.init_conv_(conv)
 
     def init_conv_(self, conv):
         o, i, h, w = conv.weight.shape
-        conv_weight = torch.empty(o // 4, i, h, w)
+        conv_weight = torch.empty(o // self.scale_squared, i, h, w)
         nn.init.kaiming_uniform_(conv_weight)
-        conv_weight = repeat(conv_weight, 'o ... -> (o 4) ...')
+        conv_weight = repeat(conv_weight, 'o ... -> (o r) ...', r = self.scale_squared)
 
         conv.weight.data.copy_(conv_weight)
         nn.init.zeros_(conv.bias.data)
