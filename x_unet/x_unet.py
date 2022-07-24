@@ -64,6 +64,32 @@ class LayerNorm(nn.Module):
         mean = torch.mean(x, dim = 1, keepdim = True)
         return (x - mean) / (var + self.eps).sqrt() * self.gamma
 
+# resnet blocks
+
+class Block(nn.Module):
+    def __init__(self, dim, dim_out, groups = 8):
+        super().__init__()
+        self.proj = nn.Conv3d(dim, dim_out, (1, 3, 3), padding = (0, 1, 1))
+        self.norm = nn.GroupNorm(groups, dim_out)
+        self.act = nn.SiLU()
+
+    def forward(self, x, scale_shift = None):
+        x = self.proj(x)
+        x = self.norm(x)
+        return self.act(x)
+
+class ResnetBlock(nn.Module):
+    def __init__(self, dim, dim_out, groups = 8):
+        super().__init__()
+        self.block1 = Block(dim, dim_out, groups = groups)
+        self.block2 = Block(dim_out, dim_out, groups = groups)
+        self.res_conv = nn.Conv3d(dim, dim_out, 1) if dim != dim_out else nn.Identity()
+
+    def forward(self, x):
+        h = self.block1(x)
+        h = self.block2(h)
+        return h + self.res_conv(x)
+
 # conv next
 # https://arxiv.org/abs/2201.03545
 
@@ -102,7 +128,9 @@ class XUnet(nn.Module):
         init_dim = None,
         out_dim = None,
         dim_mults=(1, 2, 4, 8),
-        channels = 3
+        channels = 3,
+        use_convnext = False,
+        groups = 8
     ):
         super().__init__()
         self.channels = channels
@@ -117,7 +145,10 @@ class XUnet(nn.Module):
         self.ups = nn.ModuleList([])
 
         num_resolutions = len(in_out)
-        conv_next = partial(ConvNextBlock)
+
+        # resnet or convnext
+
+        blocks = partial(ConvNextBlock) if use_convnext else partial(ResnetBlock, groups = groups)
 
         # modules for all layers
 
@@ -125,26 +156,27 @@ class XUnet(nn.Module):
             is_last = ind >= (num_resolutions - 1)
 
             self.downs.append(nn.ModuleList([
-                conv_next(dim_in, dim_out, norm = ind != 0),
-                conv_next(dim_out, dim_out),
+                blocks(dim_in, dim_out),
+                blocks(dim_out, dim_out),
                 Downsample(dim_out) if not is_last else nn.Identity()
             ]))
 
         mid_dim = dims[-1]
-        self.mid = conv_next(mid_dim, mid_dim)
+        self.mid = blocks(mid_dim, mid_dim)
 
         for ind, (dim_in, dim_out) in enumerate(reversed(in_out)):
             is_last = ind >= (num_resolutions - 1)
 
             self.ups.append(nn.ModuleList([
-                conv_next(dim_out * 2, dim_in),
-                conv_next(dim_in, dim_in),
+                blocks(dim_out * 2, dim_in),
+                blocks(dim_in, dim_in),
                 Upsample(dim_in) if not is_last else nn.Identity()
             ]))
 
         out_dim = default(out_dim, channels)
+
         self.final_conv = nn.Sequential(
-            ConvNextBlock(dim * 2, dim),
+            blocks(dim * 2, dim),
             nn.Conv3d(dim, out_dim, 3, padding = 1)
         )
 
@@ -176,9 +208,9 @@ class XUnet(nn.Module):
         out = self.final_conv(x)
 
         if is_image:
-            x = rearrange(x, 'b c 1 h w -> b c h w')
+            out = rearrange(out, 'b c 1 h w -> b c h w')
 
-        return x
+        return out
 
 # RSU
 
