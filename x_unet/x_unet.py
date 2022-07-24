@@ -164,18 +164,18 @@ class XUnet(nn.Module):
 
         h = []
 
-        for convnext, convnext2, downsample in self.downs:
-            x = convnext(x)
-            x = convnext2(x)
+        for block, block2, downsample in self.downs:
+            x = block(x)
+            x = block2(x)
             h.append(x)
             x = downsample(x)
 
         x = self.mid(x)
 
-        for convnext, convnext2, upsample in self.ups:
+        for block, block2, upsample in self.ups:
             x = torch.cat((x, h.pop()), dim=1)
-            x = convnext(x)
-            x = convnext2(x)
+            x = block(x)
+            x = block2(x)
             x = upsample(x)
 
         x = torch.cat((x, r), dim = 1)
