@@ -93,6 +93,42 @@ class ConvNextBlock(nn.Module):
         h = self.net(h)
         return h + self.res_conv(x)
 
+# attention
+
+class Attention(nn.Module):
+    def __init__(
+        self,
+        dim,
+        heads = 4,
+        dim_head = 64
+    ):
+        super().__init__()
+        self.scale = dim_head ** -0.5
+        self.heads = heads
+        inner_dim = heads * dim_head
+        self.norm = LayerNorm(dim)
+
+        self.to_qkv = nn.Conv3d(dim, inner_dim * 3, 1, bias = False)
+        self.to_out = nn.Conv3d(inner_dim, dim, 1, bias = False)
+
+    def forward(self, x):
+        f, h, w = x.shape[-3:]
+
+        x = self.norm(x)
+
+        q, k, v = self.to_qkv(x).chunk(3, dim = 1)
+        q, k, v = map(lambda t: rearrange(t, 'b (h c) ... -> b h (...) c', h = self.heads), (q, k, v))
+
+        q = q * self.scale
+
+        sim = einsum('b h i d, b h j d -> b h i j', q, k)
+        attn = sim.softmax(dim = -1)
+
+        out = einsum('b h i j, b h j d -> b h i d', attn, v)
+
+        out = rearrange(out, 'b h (f x y) d -> b (h d) f x y', f = f, x = h, y = w)
+        return self.to_out(out)
+
 # unet
 
 class XUnet(nn.Module):
@@ -101,10 +137,10 @@ class XUnet(nn.Module):
         dim,
         init_dim = None,
         out_dim = None,
-        dim_mults=(1, 2, 4, 8),
+        dim_mults = (1, 2, 4, 8),
         channels = 3,
         use_convnext = False,
-        groups = 8
+        resnet_groups = 8
     ):
         super().__init__()
         self.channels = channels
@@ -122,7 +158,7 @@ class XUnet(nn.Module):
 
         # resnet or convnext
 
-        blocks = partial(ConvNextBlock) if use_convnext else partial(ResnetBlock, groups = groups)
+        blocks = partial(ConvNextBlock) if use_convnext else partial(ResnetBlock, groups = resnet_groups)
 
         # modules for all layers
 
@@ -137,6 +173,7 @@ class XUnet(nn.Module):
 
         mid_dim = dims[-1]
         self.mid = blocks(mid_dim, mid_dim)
+        self.mid_attn = Attention(mid_dim)
 
         for ind, (dim_in, dim_out) in enumerate(reversed(in_out)):
             is_last = ind >= (num_resolutions - 1)
@@ -146,6 +183,7 @@ class XUnet(nn.Module):
                 blocks(dim_in, dim_in),
                 Upsample(dim_in) if not is_last else nn.Identity()
             ]))
+
 
         out_dim = default(out_dim, channels)
 
@@ -171,6 +209,7 @@ class XUnet(nn.Module):
             x = downsample(x)
 
         x = self.mid(x)
+        x = self.mid_attn(x) + x
 
         for block, block2, upsample in self.ups:
             x = torch.cat((x, h.pop()), dim=1)
