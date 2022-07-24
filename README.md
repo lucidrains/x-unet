@@ -23,3 +23,12 @@ Implementation of a U-net complete with efficient attention as well as the lates
     volume  = {abs/2005.09007}
 }
 ```
+
+```bibtex
+@inproceedings{Henry2020QueryKeyNF,
+    title   = {Query-Key Normalization for Transformers},
+    author  = {Alex Henry and Prudhvi Raj Dachapally and Shubham Vivek Pawar and Yuxuan Chen},
+    booktitle = {FINDINGS},
+    year    = {2020}
+}
+```
