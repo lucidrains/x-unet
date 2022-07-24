@@ -145,6 +145,8 @@ class FeatureMapConsolidator(nn.Module):
     ):
         super().__init__()
         assert len(dim_ins) == len(dim_outs)
+        self.needs_consolidating = len(dim_ins) > 0
+
         block_fn = default(conv_block_fn, Block)
 
         self.fmap_convs = nn.ModuleList([block_fn(dim_in, dim_out) for dim_in, dim_out in zip(dim_ins, dim_outs)])
@@ -160,9 +162,7 @@ class FeatureMapConsolidator(nn.Module):
 
         fmaps = default(fmaps, tuple())
 
-        assert len(fmaps) == len(self.fmap_convs)
-
-        if len(fmaps) == 0:
+        if not self.needs_consolidating:
             return x
 
         if self.resize_fmap_before:
