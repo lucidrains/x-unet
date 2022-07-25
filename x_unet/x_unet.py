@@ -17,6 +17,17 @@ def default(val, d):
 def is_power_two(n):
     return math.log2(n).is_integer()
 
+def cast_tuple(val, length = None):
+    if isinstance(val, list):
+        val = tuple(val)
+
+    output = val if isinstance(val, tuple) else ((val,) * default(length, 1))
+
+    if exists(length):
+        assert len(output) == length
+
+    return output
+
 def l2norm(t):
     return F.normalize(t, dim = -1)
 
@@ -56,10 +67,22 @@ class Block(nn.Module):
         return self.act(x)
 
 class ResnetBlock(nn.Module):
-    def __init__(self, dim, dim_out, groups = 8):
+    def __init__(
+        self,
+        dim,
+        dim_out,
+        groups = 8,
+        nested_unet_depth = 0,
+        nested_unet_dim = 32
+    ):
         super().__init__()
         self.block1 = Block(dim, dim_out, groups = groups)
-        self.block2 = Block(dim_out, dim_out, groups = groups)
+
+        if nested_unet_depth > 0:
+            self.block2 = NestedResidualUnet(dim_out, depth = nested_unet_depth, M = nested_unet_dim, add_residual = True)
+        else:
+            self.block2 = Block(dim_out, dim_out, groups = groups)
+
         self.res_conv = nn.Conv3d(dim, dim_out, 1) if dim != dim_out else nn.Identity()
 
     def forward(self, x):
@@ -77,23 +100,27 @@ class ConvNextBlock(nn.Module):
         dim_out,
         *,
         mult = 2,
-        norm = True
+        nested_unet_depth = 0,
+        nested_unet_dim = 32
     ):
         super().__init__()
         self.ds_conv = nn.Conv3d(dim, dim, (1, 7, 7), padding = (0, 3, 3), groups = dim)
 
         self.net = nn.Sequential(
-            LayerNorm(dim) if norm else nn.Identity(),
+            LayerNorm(dim),
             nn.Conv3d(dim, dim_out * mult, (1, 3, 3), padding = (0, 1, 1)),
             nn.GELU(),
             nn.Conv3d(dim_out * mult, dim_out, (1, 3, 3), padding = (0, 1, 1))
         )
+
+        self.nested_unet = NestedResidualUnet(dim_out, depth = nested_unet_depth, M = nested_unet_dim, add_residual = True) if nested_unet_depth > 0 else nn.Identity()
 
         self.res_conv = nn.Conv3d(dim, dim_out, 1) if dim != dim_out else nn.Identity()
 
     def forward(self, x, time_emb = None):
         h = self.ds_conv(x)
         h = self.net(h)
+        h = self.nested_unet(h)
         return h + self.res_conv(x)
 
 # attention
@@ -186,6 +213,8 @@ class XUnet(nn.Module):
         init_dim = None,
         out_dim = None,
         dim_mults = (1, 2, 4, 8),
+        nested_unet_depths = (0, 0, 0, 0),
+        nested_unet_dim = 32,
         channels = 3,
         use_convnext = False,
         resnet_groups = 8,
@@ -209,17 +238,21 @@ class XUnet(nn.Module):
 
         blocks = partial(ConvNextBlock) if use_convnext else partial(ResnetBlock, groups = resnet_groups)
 
+        # whether to use nested unet, as in unet squared paper
+
+        nested_unet_depths = cast_tuple(nested_unet_depths, num_resolutions)
+
         # modules for all layers
 
         skip_dims = []
 
-        for ind, (dim_in, dim_out) in enumerate(in_out):
+        for ind, ((dim_in, dim_out), nested_unet_depth) in enumerate(zip(in_out, nested_unet_depths)):
             is_last = ind >= (num_resolutions - 1)
             skip_dims.append(dim_in)
 
             self.downs.append(nn.ModuleList([
-                blocks(dim_in, dim_in),
-                blocks(dim_in, dim_in),
+                blocks(dim_in, dim_in, nested_unet_depth = nested_unet_depth, nested_unet_dim = nested_unet_dim),
+                blocks(dim_in, dim_in, nested_unet_depth = nested_unet_depth, nested_unet_dim = nested_unet_dim),
                 Downsample(dim_in, dim_out)
             ]))
 
@@ -229,12 +262,12 @@ class XUnet(nn.Module):
         self.mid_after = blocks(mid_dim, mid_dim)
         self.mid_upsample = Upsample(mid_dim, dims[-2])
 
-        for ind, (dim_in, dim_out) in enumerate(reversed(in_out[:-1])):
+        for ind, ((dim_in, dim_out), nested_unet_depth) in enumerate(zip(reversed(in_out[:-1]), reversed(nested_unet_depths[:-1]))):
             is_last = ind >= (num_resolutions - 1)
 
             self.ups.append(nn.ModuleList([
-                blocks(dim_out + skip_dims.pop(), dim_out),
-                blocks(dim_out, dim_out),
+                blocks(dim_out + skip_dims.pop(), dim_out, nested_unet_depth = nested_unet_depth, nested_unet_dim = nested_unet_dim),
+                blocks(dim_out, dim_out, nested_unet_depth = nested_unet_depth, nested_unet_dim = nested_unet_dim),
                 Upsample(dim_out, dim_in) if not is_last else nn.Identity()
             ]))
 
