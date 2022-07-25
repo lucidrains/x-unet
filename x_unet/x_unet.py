@@ -213,6 +213,7 @@ class XUnet(nn.Module):
         init_dim = None,
         out_dim = None,
         dim_mults = (1, 2, 4, 8),
+        num_blocks_per_stage = (2, 2, 2, 2),
         nested_unet_depths = (0, 0, 0, 0),
         nested_unet_dim = 32,
         channels = 3,
@@ -242,32 +243,54 @@ class XUnet(nn.Module):
 
         nested_unet_depths = cast_tuple(nested_unet_depths, num_resolutions)
 
+        # number of blocks per stage
+
+        num_blocks_per_stage = cast_tuple(num_blocks_per_stage, num_resolutions)
+        assert all([num_blocks > 0 for num_blocks in num_blocks_per_stage])
+
         # modules for all layers
 
         skip_dims = []
 
-        for ind, ((dim_in, dim_out), nested_unet_depth) in enumerate(zip(in_out, nested_unet_depths)):
+        down_stage_parameters = [
+            in_out,
+            nested_unet_depths,
+            num_blocks_per_stage
+        ]
+
+        up_stage_parameters = [reversed(params[:-1]) for params in down_stage_parameters]
+
+        # downs
+
+        for ind, ((dim_in, dim_out), nested_unet_depth, num_blocks) in enumerate(zip(*down_stage_parameters)):
             is_last = ind >= (num_resolutions - 1)
             skip_dims.append(dim_in)
 
             self.downs.append(nn.ModuleList([
                 blocks(dim_in, dim_in, nested_unet_depth = nested_unet_depth, nested_unet_dim = nested_unet_dim),
-                blocks(dim_in, dim_in, nested_unet_depth = nested_unet_depth, nested_unet_dim = nested_unet_dim),
+                nn.ModuleList([blocks(dim_in, dim_in, nested_unet_depth = nested_unet_depth, nested_unet_dim = nested_unet_dim) for _ in range(num_blocks - 1)]),
                 Downsample(dim_in, dim_out)
             ]))
 
+        # middle
+
         mid_dim = dims[-1]
-        self.mid = blocks(mid_dim, mid_dim)
+        mid_nested_unet_depth = nested_unet_depths[-1]
+
+        self.mid = blocks(mid_dim, mid_dim, nested_unet_depth = mid_nested_unet_depth, nested_unet_dim = nested_unet_dim)
         self.mid_attn = Attention(mid_dim)
-        self.mid_after = blocks(mid_dim, mid_dim)
+        self.mid_after = blocks(mid_dim, mid_dim, nested_unet_depth = mid_nested_unet_depth, nested_unet_dim = nested_unet_dim)
+
         self.mid_upsample = Upsample(mid_dim, dims[-2])
 
-        for ind, ((dim_in, dim_out), nested_unet_depth) in enumerate(zip(reversed(in_out[:-1]), reversed(nested_unet_depths[:-1]))):
+        # ups
+
+        for ind, ((dim_in, dim_out), nested_unet_depth, num_blocks) in enumerate(zip(*up_stage_parameters)):
             is_last = ind >= (num_resolutions - 1)
 
             self.ups.append(nn.ModuleList([
                 blocks(dim_out + skip_dims.pop(), dim_out, nested_unet_depth = nested_unet_depth, nested_unet_dim = nested_unet_dim),
-                blocks(dim_out, dim_out, nested_unet_depth = nested_unet_depth, nested_unet_dim = nested_unet_dim),
+                nn.ModuleList([blocks(dim_out, dim_out, nested_unet_depth = nested_unet_depth, nested_unet_dim = nested_unet_dim) for _ in range(num_blocks - 1)]),
                 Upsample(dim_out, dim_in) if not is_last else nn.Identity()
             ]))
 
@@ -302,9 +325,12 @@ class XUnet(nn.Module):
         down_hiddens = []
         up_hiddens = []
 
-        for block, block2, downsample in self.downs:
-            x = block(x)
-            x = block2(x)
+        for init_block, (blocks), downsample in self.downs:
+            x = init_block(x)
+
+            for block in blocks:
+                x = block(x)
+
             down_hiddens.append(x)
             x = downsample(x)
 
@@ -316,10 +342,14 @@ class XUnet(nn.Module):
         x = self.mid_upsample(x)
 
 
-        for block, block2, upsample in self.ups:
+        for init_block, blocks, upsample in self.ups:
             x = torch.cat((x, down_hiddens.pop()), dim=1)
-            x = block(x)
-            x = block2(x)
+
+            x = init_block(x)
+
+            for block in blocks:
+                x = block(x)
+
             up_hiddens.insert(0, x)
             x = upsample(x)
 
