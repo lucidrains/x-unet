@@ -302,7 +302,7 @@ class XUnet(nn.Module):
 
 # RSU
 
-class PixelShuffleUpsample2D(nn.Module):
+class PixelShuffleUpsample(nn.Module):
     def __init__(
         self,
         dim,
@@ -323,8 +323,8 @@ class PixelShuffleUpsample2D(nn.Module):
         self.init_conv_(conv)
 
     def init_conv_(self, conv):
-        o, i, h, w = conv.weight.shape
-        conv_weight = torch.empty(o // self.scale_squared, i, h, w)
+        o, i, *rest_dims = conv.weight.shape
+        conv_weight = torch.empty(o // self.scale_squared, i, *rest_dims)
         nn.init.kaiming_uniform_(conv_weight)
         conv_weight = repeat(conv_weight, 'o ... -> (o r) ...', r = self.scale_squared)
 
@@ -332,9 +332,20 @@ class PixelShuffleUpsample2D(nn.Module):
         nn.init.zeros_(conv.bias.data)
 
     def forward(self, x):
-        return self.net(x)
+        is_video = x.ndim == 5
 
-class NestedResidualUnet2D(nn.Module):
+        if is_video:
+            f = x.shape[2]
+            x = rearrange(x, 'b c f h w -> (b f) c h w')
+
+        x = self.net(x)
+
+        if is_video:
+            x = rearrange(x, '(b f) c h w -> b c f h w', f = f)
+
+        return x
+
+class NestedResidualUnet(nn.Module):
     def __init__(
         self,
         dim,
@@ -361,7 +372,7 @@ class NestedResidualUnet2D(nn.Module):
             )
 
             up = nn.Sequential(
-                PixelShuffleUpsample2D(2 * M, dim_in),
+                PixelShuffleUpsample(2 * M, dim_in),
                 nn.GroupNorm(groups, dim_in),
                 nn.SiLU()
             )
@@ -377,15 +388,21 @@ class NestedResidualUnet2D(nn.Module):
 
         self.add_residual = add_residual
 
-    def forward(self, x):
+    def forward(self, x, residual = None):
+        is_video = x.ndim == 5
+
+        if self.add_residual:
+            residual = default(residual, x.clone())
+
+        if is_video:
+            f = x.shape[2]
+            x = rearrange(x, 'b c f h w -> (b f) c h w')
+
         *_, h, w = x.shape
 
         assert h == w, 'only works with square images'
         assert is_power_two(h), 'height and width must be power of two'
         assert (h % (2 ** self.depth)) == 0, 'the unet has too much depth for the image being passed in'
-
-        if self.add_residual:
-            residual = x.clone()
 
         # hiddens
 
@@ -404,6 +421,9 @@ class NestedResidualUnet2D(nn.Module):
             x = up(x)
 
         # adding residual
+
+        if is_video:
+            x = rearrange(x, '(b f) c h w -> b c f h w', f = f)
 
         if self.add_residual:
             x = x + residual
