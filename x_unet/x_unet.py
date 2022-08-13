@@ -219,9 +219,12 @@ class XUnet(nn.Module):
         channels = 3,
         use_convnext = False,
         resnet_groups = 8,
-        consolidate_upsample_fmaps = True
+        consolidate_upsample_fmaps = True,
+        skip_scale = 2 ** -0.5
     ):
         super().__init__()
+
+        self.skip_scale = skip_scale
         self.channels = channels
 
         init_dim = default(init_dim, dim)
@@ -343,7 +346,7 @@ class XUnet(nn.Module):
 
 
         for init_block, blocks, upsample in self.ups:
-            x = torch.cat((x, down_hiddens.pop()), dim=1)
+            x = torch.cat((x, down_hiddens.pop() * self.skip_scale), dim=1)
 
             x = init_block(x)
 
@@ -416,7 +419,8 @@ class NestedResidualUnet(nn.Module):
         depth,
         M = 32,
         add_residual = False,
-        groups = 4
+        groups = 4,
+        skip_scale = 2 ** -0.5
     ):
         super().__init__()
 
@@ -449,6 +453,7 @@ class NestedResidualUnet(nn.Module):
             nn.SiLU()
         )
 
+        self.skip_scale = skip_scale
         self.add_residual = add_residual
 
     def forward(self, x, residual = None):
@@ -480,7 +485,7 @@ class NestedResidualUnet(nn.Module):
         x = self.mid(x)
 
         for up in reversed(self.ups):
-            x = torch.cat((x, hiddens.pop()), dim = 1)
+            x = torch.cat((x, hiddens.pop() * self.skip_scale), dim = 1)
             x = up(x)
 
         # adding residual
