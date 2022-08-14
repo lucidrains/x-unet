@@ -1,4 +1,6 @@
-## x-unet (wip)
+<img src="./unet.png" width="450px"></img>
+
+## x-unet
 
 Implementation of a U-net complete with efficient attention as well as the latest research findings
 
@@ -14,7 +16,7 @@ $ pip install x-unet
 import torch
 from x_unet import XUnet
 
-unet_squared = XUnet(
+unet = XUnet(
     dim = 64,
     dim_mults = (1, 2, 4, 8),
     nested_unet_depths = (7, 4, 2, 1),     # nested unet depths, from unet-squared paper
@@ -22,7 +24,7 @@ unet_squared = XUnet(
 )
 
 img = torch.randn(1, 3, 256, 256)
-out = unet_squared(img) # (1, 3, 256, 256)
+out = unet(img) # (1, 3, 256, 256)
 ```
 
 ## Citations
