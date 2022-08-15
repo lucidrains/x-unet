@@ -52,6 +52,18 @@ class LayerNorm(nn.Module):
         mean = torch.mean(x, dim = 1, keepdim = True)
         return (x - mean) / (var + eps).sqrt() * self.gamma
 
+class WeightStandardizedConv2d(nn.Conv2d):
+    def forward(self, x):
+        eps = 1e-5 if x.dtype == torch.float32 else 1e-3
+
+        weight = self.weight
+
+        mean = reduce(weight, 'o ... -> o 1 1 1', 'mean')
+        var = reduce(weight, 'o ... -> o 1 1 1', partial(torch.var, unbiased = False))
+        weight = (weight - mean) * (var + eps).rsqrt()
+
+        return F.conv2d(x, weight, self.bias, self.stride, self.padding, self.dilation, self.groups)
+
 class WeightStandardizedConv3d(nn.Conv3d):
     def forward(self, x):
         eps = 1e-5 if x.dtype == torch.float32 else 1e-3
@@ -94,7 +106,7 @@ class ResnetBlock(nn.Module):
         self.block1 = Block(dim, dim_out, groups = groups, weight_standardize = weight_standardize)
 
         if nested_unet_depth > 0:
-            self.block2 = NestedResidualUnet(dim_out, depth = nested_unet_depth, M = nested_unet_dim, add_residual = True)
+            self.block2 = NestedResidualUnet(dim_out, depth = nested_unet_depth, M = nested_unet_dim, add_residual = True, weight_standardize = weight_standardize)
         else:
             self.block2 = Block(dim_out, dim_out, groups = groups, weight_standardize = weight_standardize)
 
@@ -436,7 +448,8 @@ class NestedResidualUnet(nn.Module):
         M = 32,
         add_residual = False,
         groups = 4,
-        skip_scale = 2 ** -0.5
+        skip_scale = 2 ** -0.5,
+        weight_standardize = False
     ):
         super().__init__()
 
@@ -444,12 +457,14 @@ class NestedResidualUnet(nn.Module):
         self.downs = nn.ModuleList([])
         self.ups = nn.ModuleList([])
 
+        conv = WeightStandardizedConv2d if weight_standardize else nn.Conv2d
+
         for ind in range(depth):
             is_first = ind == 0
             dim_in = dim if is_first else M
 
             down = nn.Sequential(
-                nn.Conv2d(dim_in, M, 4, stride = 2, padding = 1),
+                conv(dim_in, M, 4, stride = 2, padding = 1),
                 nn.GroupNorm(groups, M),
                 nn.SiLU()
             )
@@ -464,7 +479,7 @@ class NestedResidualUnet(nn.Module):
             self.ups.append(up)
 
         self.mid = nn.Sequential(
-            nn.Conv2d(M, M, 3, padding = 1),
+            conv(M, M, 3, padding = 1),
             nn.GroupNorm(groups, M),
             nn.SiLU()
         )
