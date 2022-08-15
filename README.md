@@ -57,3 +57,13 @@ out = unet(img) # (1, 3, 256, 256)
     year    = {2020}
 }
 ```
+
+```bibtex
+@article{Qiao2019WeightS,
+    title   = {Weight Standardization},
+    author  = {Siyuan Qiao and Huiyu Wang and Chenxi Liu and Wei Shen and Alan Loddon Yuille},
+    journal = {ArXiv},
+    year    = {2019},
+    volume  = {abs/1903.10520}
+}
+```

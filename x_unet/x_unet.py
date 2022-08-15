@@ -4,7 +4,7 @@ import math
 import torch
 from torch import nn, einsum
 import torch.nn.functional as F
-from einops import rearrange, repeat
+from einops import rearrange, repeat, reduce
 
 # helper functions
 
@@ -42,22 +42,36 @@ def Downsample(dim, dim_out):
 # normalization
 
 class LayerNorm(nn.Module):
-    def __init__(self, dim, eps = 1e-5):
+    def __init__(self, dim):
         super().__init__()
-        self.eps = eps
         self.gamma = nn.Parameter(torch.ones(1, dim, 1, 1, 1))
 
     def forward(self, x):
+        eps = 1e-5 if x.dtype == torch.float32 else 1e-3
         var = torch.var(x, dim = 1, unbiased = False, keepdim = True)
         mean = torch.mean(x, dim = 1, keepdim = True)
-        return (x - mean) / (var + self.eps).sqrt() * self.gamma
+        return (x - mean) / (var + eps).sqrt() * self.gamma
+
+class WeightStandardizedConv3d(nn.Conv3d):
+    def forward(self, x):
+        eps = 1e-5 if x.dtype == torch.float32 else 1e-3
+
+        weight = self.weight
+
+        mean = reduce(weight, 'o ... -> o 1 1 1 1', 'mean')
+        var = reduce(weight, 'o ... -> o 1 1 1 1', partial(torch.var, unbiased = False))
+        weight = (weight - mean) * (var + eps).rsqrt()
+
+        return F.conv3d(x, weight, self.bias, self.stride, self.padding, self.dilation, self.groups)
 
 # resnet blocks
 
 class Block(nn.Module):
-    def __init__(self, dim, dim_out, groups = 8):
+    def __init__(self, dim, dim_out, groups = 8, weight_standardize = False):
         super().__init__()
-        self.proj = nn.Conv3d(dim, dim_out, (1, 3, 3), padding = (0, 1, 1))
+        conv = nn.Conv3d if not weight_standardize else WeightStandardizedConv3d
+
+        self.proj = conv(dim, dim_out, (1, 3, 3), padding = (0, 1, 1))
         self.norm = nn.GroupNorm(groups, dim_out)
         self.act = nn.SiLU()
 
@@ -73,15 +87,16 @@ class ResnetBlock(nn.Module):
         dim_out,
         groups = 8,
         nested_unet_depth = 0,
-        nested_unet_dim = 32
+        nested_unet_dim = 32,
+        weight_standardize = False
     ):
         super().__init__()
-        self.block1 = Block(dim, dim_out, groups = groups)
+        self.block1 = Block(dim, dim_out, groups = groups, weight_standardize = weight_standardize)
 
         if nested_unet_depth > 0:
             self.block2 = NestedResidualUnet(dim_out, depth = nested_unet_depth, M = nested_unet_dim, add_residual = True)
         else:
-            self.block2 = Block(dim_out, dim_out, groups = groups)
+            self.block2 = Block(dim_out, dim_out, groups = groups, weight_standardize = weight_standardize)
 
         self.res_conv = nn.Conv3d(dim, dim_out, 1) if dim != dim_out else nn.Identity()
 
@@ -220,7 +235,8 @@ class XUnet(nn.Module):
         use_convnext = False,
         resnet_groups = 8,
         consolidate_upsample_fmaps = True,
-        skip_scale = 2 ** -0.5
+        skip_scale = 2 ** -0.5,
+        weight_standardize = False
     ):
         super().__init__()
 
@@ -240,7 +256,7 @@ class XUnet(nn.Module):
 
         # resnet or convnext
 
-        blocks = partial(ConvNextBlock) if use_convnext else partial(ResnetBlock, groups = resnet_groups)
+        blocks = partial(ConvNextBlock) if use_convnext else partial(ResnetBlock, groups = resnet_groups, weight_standardize = weight_standardize)
 
         # whether to use nested unet, as in unet squared paper
 
