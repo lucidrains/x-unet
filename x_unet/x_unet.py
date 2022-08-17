@@ -158,7 +158,7 @@ class Attention(nn.Module):
         dim,
         heads = 4,
         dim_head = 64,
-        scale = 16
+        scale = 8
     ):
         super().__init__()
         self.scale = scale
@@ -171,6 +171,8 @@ class Attention(nn.Module):
 
     def forward(self, x):
         f, h, w = x.shape[-3:]
+
+        residual = x.clone()
 
         x = self.norm(x)
 
@@ -185,7 +187,7 @@ class Attention(nn.Module):
         out = einsum('b h i j, b h j d -> b h i d', attn, v)
 
         out = rearrange(out, 'b h (f x y) d -> b (h d) f x y', f = f, x = h, y = w)
-        return self.to_out(out)
+        return self.to_out(out) + residual
 
 class FeatureMapConsolidator(nn.Module):
     def __init__(
