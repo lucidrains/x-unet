@@ -41,6 +41,14 @@ def Downsample(dim, dim_out):
 
 # normalization
 
+class Residual(nn.Module):
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+
+    def forward(self, x):
+        return self.fn(x) + x
+
 class LayerNorm(nn.Module):
     def __init__(self, dim):
         super().__init__()
@@ -162,6 +170,18 @@ class ConvNextBlock(nn.Module):
         h = self.nested_unet(h)
         return h + self.res_conv(x)
 
+# feedforward
+
+def FeedForward(dim, mult = 4.):
+    inner_dim = int(dim * mult)
+    return Residual(nn.Sequential(
+        LayerNorm(dim),
+        nn.Conv3d(dim, inner_dim, 1, bias = False),
+        nn.GELU(),
+        LayerNorm(inner_dim),   # properly credit assign normformer
+        nn.Conv3d(inner_dim, dim, 1, bias = False)
+    ))
+
 # attention
 
 class Attention(nn.Module):
@@ -200,6 +220,23 @@ class Attention(nn.Module):
 
         out = rearrange(out, 'b h (f x y) d -> b (h d) f x y', f = f, x = h, y = w)
         return self.to_out(out) + residual
+
+class TransformerBlock(nn.Module):
+    def __init__(
+        self,
+        dim,
+        *,
+        depth,
+        **kwargs
+    ):
+        super().__init__()
+        self.attn = Attention(dim, **kwargs)
+        self.ff =FeedForward(dim)
+
+    def forward(self, x):
+        x = self.attn(x)
+        x = self.ff(x)
+        return x
 
 class FeatureMapConsolidator(nn.Module):
     def __init__(
@@ -260,6 +297,7 @@ class XUnet(nn.Module):
         frame_kernel_size = 1,
         dim_mults = (1, 2, 4, 8),
         num_blocks_per_stage = (2, 2, 2, 2),
+        num_self_attn_per_stage = (0, 0, 0, 1),
         nested_unet_depths = (0, 0, 0, 0),
         nested_unet_dim = 32,
         channels = 3,
@@ -267,7 +305,9 @@ class XUnet(nn.Module):
         resnet_groups = 8,
         consolidate_upsample_fmaps = True,
         skip_scale = 2 ** -0.5,
-        weight_standardize = False
+        weight_standardize = False,
+        attn_heads = 8,
+        attn_dim_head = 32
     ):
         super().__init__()
 
@@ -300,6 +340,18 @@ class XUnet(nn.Module):
         num_blocks_per_stage = cast_tuple(num_blocks_per_stage, num_resolutions)
         assert all([num_blocks > 0 for num_blocks in num_blocks_per_stage])
 
+        # number of self attention blocks per stage
+
+        num_self_attn_per_stage = cast_tuple(num_self_attn_per_stage, num_resolutions)
+        assert all([num_self_attn_blocks >= 0 for num_self_attn_blocks in num_self_attn_per_stage])
+
+        # attn kwargs
+
+        attn_kwargs = dict(
+            heads = attn_heads,
+            dim_head = attn_dim_head
+        )
+
         # modules for all layers
 
         skip_dims = []
@@ -307,20 +359,22 @@ class XUnet(nn.Module):
         down_stage_parameters = [
             in_out,
             nested_unet_depths,
-            num_blocks_per_stage
+            num_blocks_per_stage,
+            num_self_attn_per_stage
         ]
 
         up_stage_parameters = [reversed(params[:-1]) for params in down_stage_parameters]
 
         # downs
 
-        for ind, ((dim_in, dim_out), nested_unet_depth, num_blocks) in enumerate(zip(*down_stage_parameters)):
+        for ind, ((dim_in, dim_out), nested_unet_depth, num_blocks, self_attn_blocks) in enumerate(zip(*down_stage_parameters)):
             is_last = ind >= (num_resolutions - 1)
             skip_dims.append(dim_in)
 
             self.downs.append(nn.ModuleList([
                 blocks(dim_in, dim_in, nested_unet_depth = nested_unet_depth, nested_unet_dim = nested_unet_dim),
                 nn.ModuleList([blocks(dim_in, dim_in, nested_unet_depth = nested_unet_depth, nested_unet_dim = nested_unet_dim) for _ in range(num_blocks - 1)]),
+                nn.ModuleList([TransformerBlock(dim_in, depth = self_attn_blocks, **attn_kwargs) for _ in range(self_attn_blocks)]),
                 Downsample(dim_in, dim_out)
             ]))
 
@@ -337,12 +391,13 @@ class XUnet(nn.Module):
 
         # ups
 
-        for ind, ((dim_in, dim_out), nested_unet_depth, num_blocks) in enumerate(zip(*up_stage_parameters)):
+        for ind, ((dim_in, dim_out), nested_unet_depth, num_blocks, self_attn_blocks) in enumerate(zip(*up_stage_parameters)):
             is_last = ind >= (num_resolutions - 1)
 
             self.ups.append(nn.ModuleList([
                 blocks(dim_out + skip_dims.pop(), dim_out, nested_unet_depth = nested_unet_depth, nested_unet_dim = nested_unet_dim),
                 nn.ModuleList([blocks(dim_out, dim_out, nested_unet_depth = nested_unet_depth, nested_unet_dim = nested_unet_dim) for _ in range(num_blocks - 1)]),
+                nn.ModuleList([TransformerBlock(dim_out, depth = self_attn_blocks, **attn_kwargs) for _ in range(self_attn_blocks)]),
                 Upsample(dim_out, dim_in) if not is_last else nn.Identity()
             ]))
 
@@ -392,11 +447,14 @@ class XUnet(nn.Module):
         down_hiddens = []
         up_hiddens = []
 
-        for init_block, (blocks), downsample in self.downs:
+        for init_block, blocks, attn_blocks, downsample in self.downs:
             x = init_block(x)
 
             for block in blocks:
                 x = block(x)
+
+            for attn_block in attn_blocks:
+                x = attn_block(x)
 
             down_hiddens.append(x)
             x = downsample(x)
@@ -409,13 +467,16 @@ class XUnet(nn.Module):
         x = self.mid_upsample(x)
 
 
-        for init_block, blocks, upsample in self.ups:
+        for init_block, blocks, attn_blocks, upsample in self.ups:
             x = torch.cat((x, down_hiddens.pop() * self.skip_scale), dim=1)
 
             x = init_block(x)
 
             for block in blocks:
                 x = block(x)
+
+            for attn_block in attn_blocks:
+                x = attn_block(x)
 
             up_hiddens.insert(0, x)
             x = upsample(x)
