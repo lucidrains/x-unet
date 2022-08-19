@@ -91,3 +91,13 @@ out = unet(video) # (1, 3, 10, 128, 128)
     volume  = {abs/1903.10520}
 }
 ```
+
+```bibtex
+@article{Shleifer2021NormFormerIT,
+    title   = {NormFormer: Improved Transformer Pretraining with Extra Normalization},
+    author  = {Sam Shleifer and Jason Weston and Myle Ott},
+    journal = {ArXiv},
+    year    = {2021},
+    volume  = {abs/2110.09456}
+}
+```
