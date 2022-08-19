@@ -79,11 +79,19 @@ class WeightStandardizedConv3d(nn.Conv3d):
 # resnet blocks
 
 class Block(nn.Module):
-    def __init__(self, dim, dim_out, groups = 8, weight_standardize = False):
+    def __init__(
+        self,
+        dim,
+        dim_out,
+        groups = 8,
+        weight_standardize = False,
+        frame_kernel_size = 1
+    ):
         super().__init__()
+        kernel_conv_kwargs = partial(kernel_and_same_pad, frame_kernel_size)
         conv = nn.Conv3d if not weight_standardize else WeightStandardizedConv3d
 
-        self.proj = conv(dim, dim_out, (1, 3, 3), padding = (0, 1, 1))
+        self.proj = conv(dim, dim_out, **kernel_conv_kwargs(3, 3))
         self.norm = nn.GroupNorm(groups, dim_out)
         self.act = nn.SiLU()
 
@@ -98,17 +106,18 @@ class ResnetBlock(nn.Module):
         dim,
         dim_out,
         groups = 8,
+        frame_kernel_size = 1,
         nested_unet_depth = 0,
         nested_unet_dim = 32,
         weight_standardize = False
     ):
         super().__init__()
-        self.block1 = Block(dim, dim_out, groups = groups, weight_standardize = weight_standardize)
+        self.block1 = Block(dim, dim_out, groups = groups, weight_standardize = weight_standardize, frame_kernel_size = frame_kernel_size)
 
         if nested_unet_depth > 0:
             self.block2 = NestedResidualUnet(dim_out, depth = nested_unet_depth, M = nested_unet_dim, add_residual = True, weight_standardize = weight_standardize)
         else:
-            self.block2 = Block(dim_out, dim_out, groups = groups, weight_standardize = weight_standardize)
+            self.block2 = Block(dim_out, dim_out, groups = groups, weight_standardize = weight_standardize, frame_kernel_size = frame_kernel_size)
 
         self.res_conv = nn.Conv3d(dim, dim_out, 1) if dim != dim_out else nn.Identity()
 
@@ -127,17 +136,20 @@ class ConvNextBlock(nn.Module):
         dim_out,
         *,
         mult = 2,
+        frame_kernel_size = 1,
         nested_unet_depth = 0,
         nested_unet_dim = 32
     ):
         super().__init__()
-        self.ds_conv = nn.Conv3d(dim, dim, (1, 7, 7), padding = (0, 3, 3), groups = dim)
+        kernel_conv_kwargs = partial(kernel_and_same_pad, frame_kernel_size)
+
+        self.ds_conv = nn.Conv3d(dim, dim, **kernel_conv_kwargs(7, 7), groups = dim)
 
         self.net = nn.Sequential(
             LayerNorm(dim),
-            nn.Conv3d(dim, dim_out * mult, (1, 3, 3), padding = (0, 1, 1)),
+            nn.Conv3d(dim, dim_out * mult, **kernel_conv_kwargs(3, 3)),
             nn.GELU(),
-            nn.Conv3d(dim_out * mult, dim_out, (1, 3, 3), padding = (0, 1, 1))
+            nn.Conv3d(dim_out * mult, dim_out, **kernel_conv_kwargs(3, 3))
         )
 
         self.nested_unet = NestedResidualUnet(dim_out, depth = nested_unet_depth, M = nested_unet_dim, add_residual = True) if nested_unet_depth > 0 else nn.Identity()
@@ -235,12 +247,17 @@ class FeatureMapConsolidator(nn.Module):
 
 # unet
 
+def kernel_and_same_pad(*kernel_size):
+    paddings = tuple(map(lambda k: k // 2, kernel_size))
+    return dict(kernel_size = kernel_size, padding = paddings)
+
 class XUnet(nn.Module):
     def __init__(
         self,
         dim,
         init_dim = None,
         out_dim = None,
+        frame_kernel_size = 1,
         dim_mults = (1, 2, 4, 8),
         num_blocks_per_stage = (2, 2, 2, 2),
         nested_unet_depths = (0, 0, 0, 0),
@@ -254,11 +271,13 @@ class XUnet(nn.Module):
     ):
         super().__init__()
 
+        self.train_as_images = frame_kernel_size == 1
+
         self.skip_scale = skip_scale
         self.channels = channels
 
         init_dim = default(init_dim, dim)
-        self.init_conv = nn.Conv3d(channels, init_dim, (1, 7, 7), padding = (0, 3, 3))
+        self.init_conv = nn.Conv3d(channels, init_dim, **kernel_and_same_pad(frame_kernel_size, 7, 7))
 
         dims = [init_dim, *map(lambda m: dim * m, dim_mults)]
         in_out = list(zip(dims[:-1], dims[1:]))
@@ -270,7 +289,7 @@ class XUnet(nn.Module):
 
         # resnet or convnext
 
-        blocks = partial(ConvNextBlock) if use_convnext else partial(ResnetBlock, groups = resnet_groups, weight_standardize = weight_standardize)
+        blocks = partial(ConvNextBlock, frame_kernel_size = frame_kernel_size) if use_convnext else partial(ResnetBlock, groups = resnet_groups, weight_standardize = weight_standardize, frame_kernel_size = frame_kernel_size)
 
         # whether to use nested unet, as in unet squared paper
 
@@ -344,16 +363,31 @@ class XUnet(nn.Module):
 
         self.final_conv = nn.Sequential(
             blocks(final_dim_in + dim, dim),
-            nn.Conv3d(dim, out_dim, 3, padding = 1)
+            nn.Conv3d(dim, out_dim, **kernel_and_same_pad(frame_kernel_size, 3, 3))
         )
 
     def forward(self, x):
         is_image = x.ndim == 4
+
+        # validations
+
+        assert not (is_image and not self.train_as_images), 'you specified a frame kernel size for the convolutions in this unet, but you are passing in images'
+        assert not (not is_image and self.train_as_images), 'you specified no frame kernel size dimension, yet you are passing in a video. fold the frame dimension into the batch'
+
+        # cast images to 1 framed video
+
         if is_image:
             x = rearrange(x, 'b c h w -> b c 1 h w')
 
+        # initial convolution
+
         x = self.init_conv(x)
+
+        # residual
+
         r = x.clone()
+
+        # downs and ups
 
         down_hiddens = []
         up_hiddens = []
@@ -386,9 +420,16 @@ class XUnet(nn.Module):
             up_hiddens.insert(0, x)
             x = upsample(x)
 
+        # consolidate feature maps
+
         x = self.consolidator(x, up_hiddens)
 
+        # final residual
+
         x = torch.cat((x, r), dim = 1)
+
+        # final convolution
+
         out = self.final_conv(x)
 
         if is_image:
