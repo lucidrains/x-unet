@@ -103,7 +103,7 @@ class Block(nn.Module):
         self.norm = nn.GroupNorm(groups, dim_out)
         self.act = nn.SiLU()
 
-    def forward(self, x, scale_shift = None):
+    def forward(self, x):
         x = self.proj(x)
         x = self.norm(x)
         return self.act(x)
