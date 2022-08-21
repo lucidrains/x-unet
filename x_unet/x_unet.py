@@ -4,7 +4,9 @@ import math
 import torch
 from torch import nn, einsum
 import torch.nn.functional as F
+
 from einops import rearrange, repeat, reduce
+from einops.layers.torch import Rearrange
 
 # helper functions
 
@@ -60,18 +62,6 @@ class LayerNorm(nn.Module):
         mean = torch.mean(x, dim = 1, keepdim = True)
         return (x - mean) / (var + eps).sqrt() * self.gamma
 
-class WeightStandardizedConv2d(nn.Conv2d):
-    def forward(self, x):
-        eps = 1e-5 if x.dtype == torch.float32 else 1e-3
-
-        weight = self.weight
-
-        mean = reduce(weight, 'o ... -> o 1 1 1', 'mean')
-        var = reduce(weight, 'o ... -> o 1 1 1', partial(torch.var, unbiased = False))
-        weight = (weight - mean) * (var + eps).rsqrt()
-
-        return F.conv2d(x, weight, self.bias, self.stride, self.padding, self.dilation, self.groups)
-
 class WeightStandardizedConv3d(nn.Conv3d):
     def forward(self, x):
         eps = 1e-5 if x.dtype == torch.float32 else 1e-3
@@ -123,7 +113,7 @@ class ResnetBlock(nn.Module):
         self.block1 = Block(dim, dim_out, groups = groups, weight_standardize = weight_standardize, frame_kernel_size = frame_kernel_size)
 
         if nested_unet_depth > 0:
-            self.block2 = NestedResidualUnet(dim_out, depth = nested_unet_depth, M = nested_unet_dim, add_residual = True, weight_standardize = weight_standardize)
+            self.block2 = NestedResidualUnet(dim_out, depth = nested_unet_depth, M = nested_unet_dim, frame_kernel_size = frame_kernel_size, weight_standardize = weight_standardize, add_residual = True)
         else:
             self.block2 = Block(dim_out, dim_out, groups = groups, weight_standardize = weight_standardize, frame_kernel_size = frame_kernel_size)
 
@@ -510,12 +500,12 @@ class PixelShuffleUpsample(nn.Module):
         super().__init__()
         self.scale_squared = scale_factor ** 2
         dim_out = default(dim_out, dim)
-        conv = nn.Conv2d(dim, dim_out * self.scale_squared, 1)
+        conv = nn.Conv3d(dim, dim_out * self.scale_squared, 1)
 
         self.net = nn.Sequential(
             conv,
             nn.SiLU(),
-            nn.PixelShuffle(scale_factor)
+            Rearrange('b (c r s) f h w -> b c f (h r) (w s)', r = scale_factor, s = scale_factor)
         )
 
         self.init_conv_(conv)
@@ -530,17 +520,7 @@ class PixelShuffleUpsample(nn.Module):
         nn.init.zeros_(conv.bias.data)
 
     def forward(self, x):
-        is_video = x.ndim == 5
-
-        if is_video:
-            f = x.shape[2]
-            x = rearrange(x, 'b c f h w -> (b f) c h w')
-
         x = self.net(x)
-
-        if is_video:
-            x = rearrange(x, '(b f) c h w -> b c f h w', f = f)
-
         return x
 
 class NestedResidualUnet(nn.Module):
@@ -550,6 +530,7 @@ class NestedResidualUnet(nn.Module):
         *,
         depth,
         M = 32,
+        frame_kernel_size = 1,
         add_residual = False,
         groups = 4,
         skip_scale = 2 ** -0.5,
@@ -561,14 +542,14 @@ class NestedResidualUnet(nn.Module):
         self.downs = nn.ModuleList([])
         self.ups = nn.ModuleList([])
 
-        conv = WeightStandardizedConv2d if weight_standardize else nn.Conv2d
+        conv = WeightStandardizedConv3d if weight_standardize else nn.Conv3d
 
         for ind in range(depth):
             is_first = ind == 0
             dim_in = dim if is_first else M
 
             down = nn.Sequential(
-                conv(dim_in, M, 4, stride = 2, padding = 1),
+                conv(dim_in, M, (1, 4, 4), stride = (1, 2, 2), padding = (0, 1, 1)),
                 nn.GroupNorm(groups, M),
                 nn.SiLU()
             )
@@ -583,7 +564,7 @@ class NestedResidualUnet(nn.Module):
             self.ups.append(up)
 
         self.mid = nn.Sequential(
-            conv(M, M, 3, padding = 1),
+            conv(M, M, **kernel_and_same_pad(frame_kernel_size, 3, 3)),
             nn.GroupNorm(groups, M),
             nn.SiLU()
         )
@@ -596,10 +577,6 @@ class NestedResidualUnet(nn.Module):
 
         if self.add_residual:
             residual = default(residual, x.clone())
-
-        if is_video:
-            f = x.shape[2]
-            x = rearrange(x, 'b c f h w -> (b f) c h w')
 
         *_, h, w = x.shape
 
@@ -624,9 +601,6 @@ class NestedResidualUnet(nn.Module):
             x = up(x)
 
         # adding residual
-
-        if is_video:
-            x = rearrange(x, '(b f) c h w -> b c f h w', f = f)
 
         if self.add_residual:
             x = x + residual
