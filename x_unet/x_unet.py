@@ -39,7 +39,10 @@ def Upsample(dim, dim_out):
     return nn.ConvTranspose3d(dim, dim_out, (1, 4, 4), (1, 2, 2), (0, 1, 1))
 
 def Downsample(dim, dim_out):
-    return nn.Conv3d(dim, dim_out, (1, 4, 4), (1, 2, 2), (0, 1, 1))
+    return nn.Sequential(
+        Rearrange('b c f (h s1) (w s2) -> b (c s1 s2) f h w', s1 = 2, s2 = 2),
+        nn.Conv3d(dim * 4, dim_out, 1)
+    )
 
 # normalization
 

@@ -101,3 +101,13 @@ out = unet(video) # (1, 3, 10, 128, 128)
     volume  = {abs/2110.09456}
 }
 ```
+
+```bibtex
+@article{Sunkara2022NoMS,
+    title   = {No More Strided Convolutions or Pooling: A New CNN Building Block for Low-Resolution Images and Small Objects},
+    author  = {Raja Sunkara and Tie Luo},
+    journal = {ArXiv},
+    year    = {2022},
+    volume  = {abs/2208.03641}
+}
+```
