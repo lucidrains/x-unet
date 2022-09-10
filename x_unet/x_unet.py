@@ -19,6 +19,9 @@ def default(val, d):
 def is_power_two(n):
     return math.log2(n).is_integer()
 
+def divisible_by(num, denom):
+    return (num % denom) == 0
+
 def cast_tuple(val, length = None):
     if isinstance(val, list):
         val = tuple(val)
@@ -583,8 +586,10 @@ class NestedResidualUnet(nn.Module):
 
         *_, h, w = x.shape
 
+        layers = len(self.ups)
+
         assert h == w, 'only works with square images'
-        assert is_power_two(h), 'height and width must be power of two'
+        assert divisible_by(h, 2 ** len(self.ups)), f'dimension {h} must be divisible by {2 ** layers} ({layers} layers in nested unet)'
         assert (h % (2 ** self.depth)) == 0, 'the unet has too much depth for the image being passed in'
 
         # hiddens
