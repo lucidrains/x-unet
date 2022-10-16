@@ -33,9 +33,6 @@ def cast_tuple(val, length = None):
 
     return output
 
-def l2norm(t):
-    return F.normalize(t, dim = -1)
-
 # helper classes
 
 def Upsample(dim, dim_out):
@@ -185,11 +182,10 @@ class Attention(nn.Module):
         self,
         dim,
         heads = 4,
-        dim_head = 64,
-        scale = 8
+        dim_head = 64
     ):
         super().__init__()
-        self.scale = scale
+        self.scale = dim_head ** -0.5
         self.heads = heads
         inner_dim = heads * dim_head
         self.norm = LayerNorm(dim)
@@ -207,9 +203,8 @@ class Attention(nn.Module):
         q, k, v = self.to_qkv(x).chunk(3, dim = 1)
         q, k, v = map(lambda t: rearrange(t, 'b (h c) ... -> b h (...) c', h = self.heads), (q, k, v))
 
-        q, k = map(l2norm, (q, k))
-
-        sim = einsum('b h i d, b h j d -> b h i j', q, k) * self.scale
+        q = q * self.scale
+        sim = einsum('b h i d, b h j d -> b h i j', q, k)
         attn = sim.softmax(dim = -1)
 
         out = einsum('b h i j, b h j d -> b h i d', attn, v)
