@@ -18,6 +18,7 @@ from x_unet import XUnet
 
 unet = XUnet(
     dim = 64,
+    channels = 3,
     dim_mults = (1, 2, 4, 8),
     nested_unet_depths = (7, 4, 2, 1),     # nested unet depths, from unet-squared paper
     consolidate_upsample_fmaps = True,     # whether to consolidate outputs from all upsample blocks, used in unet-squared paper
@@ -36,6 +37,7 @@ from x_unet import XUnet
 unet = XUnet(
     dim = 64,
     frame_kernel_size = 3,                 # set this to greater than 1
+    channels = 3,
     dim_mults = (1, 2, 4, 8),
     nested_unet_depths = (5, 4, 2, 1),     # nested unet depths, from unet-squared paper
     consolidate_upsample_fmaps = True,     # whether to consolidate outputs from all upsample blocks, used in unet-squared paper
