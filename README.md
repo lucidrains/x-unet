@@ -111,3 +111,11 @@ out = unet(video) # (1, 3, 10, 128, 128)
     volume  = {abs/2208.03641}
 }
 ```
+
+```bibtex
+@inproceedings{Woo2023ConvNeXtVC,
+    title   = {ConvNeXt V2: Co-designing and Scaling ConvNets with Masked Autoencoders},
+    author  = {Sanghyun Woo and Shoubhik Debnath and Ronghang Hu and Xinlei Chen and Zhuang Liu and In-So Kweon and Saining Xie},
+    year    = {2023}
+}
+```

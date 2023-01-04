@@ -127,8 +127,21 @@ class ResnetBlock(nn.Module):
         h = self.block2(h)
         return h + self.res_conv(x)
 
-# conv next
-# https://arxiv.org/abs/2201.03545
+# convnext 2
+
+class GRN(nn.Module):
+    """ global response normalization, proposed in updated convnext paper """
+
+    def __init__(self, dim, eps = 1e-5):
+        super().__init__()
+        self.eps = eps
+        self.gamma = nn.Parameter(torch.zeros(dim, 1, 1, 1))
+        self.bias = nn.Parameter(torch.zeros(dim, 1, 1, 1))
+
+    def forward(self, x):
+        spatial_l2_norm = x.norm(p = 2, dim = (2, 3, 4), keepdim = True)
+        feat_norm = spatial_l2_norm / spatial_l2_norm.mean(dim = -1, keepdim = True).clamp(min = self.eps)
+        return x * feat_norm * self.gamma + self.bias + x
 
 class ConvNextBlock(nn.Module):
     def __init__(
@@ -146,11 +159,14 @@ class ConvNextBlock(nn.Module):
 
         self.ds_conv = nn.Conv3d(dim, dim, **kernel_conv_kwargs(7, 7), groups = dim)
 
+        inner_dim = dim_out * mult
+
         self.net = nn.Sequential(
             LayerNorm(dim),
-            nn.Conv3d(dim, dim_out * mult, **kernel_conv_kwargs(3, 3)),
+            nn.Conv3d(dim, inner_dim, **kernel_conv_kwargs(3, 3)),
             nn.GELU(),
-            nn.Conv3d(dim_out * mult, dim_out, **kernel_conv_kwargs(3, 3))
+            GRN(inner_dim),
+            nn.Conv3d(inner_dim, dim_out, **kernel_conv_kwargs(3, 3))
         )
 
         self.nested_unet = NestedResidualUnet(dim_out, depth = nested_unet_depth, M = nested_unet_dim, add_residual = True) if nested_unet_depth > 0 else nn.Identity()
