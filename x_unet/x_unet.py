@@ -163,10 +163,10 @@ class ConvNextBlock(nn.Module):
 
         self.net = nn.Sequential(
             LayerNorm(dim),
-            nn.Conv3d(dim, inner_dim, **kernel_conv_kwargs(3, 3)),
+            nn.Conv3d(dim, inner_dim, **kernel_conv_kwargs(3, 3), groups = dim_out),
             nn.GELU(),
             GRN(inner_dim),
-            nn.Conv3d(inner_dim, dim_out, **kernel_conv_kwargs(3, 3))
+            nn.Conv3d(inner_dim, dim_out, **kernel_conv_kwargs(3, 3), groups = dim_out)
         )
 
         self.nested_unet = NestedResidualUnet(dim_out, depth = nested_unet_depth, M = nested_unet_dim, add_residual = True) if nested_unet_depth > 0 else nn.Identity()
