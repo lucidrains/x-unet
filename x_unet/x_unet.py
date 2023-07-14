@@ -8,6 +8,9 @@ import torch.nn.functional as F
 from einops import rearrange, repeat, reduce
 from einops.layers.torch import Rearrange
 
+from beartype import beartype
+from beartype.typing import Tuple, Union, Optional
+
 # helper functions
 
 def exists(val):
@@ -291,21 +294,26 @@ class FeatureMapConsolidator(nn.Module):
 
 # unet
 
+def MaybeTuple(type):
+    return Union[type, Tuple[type, ...]]
+
 def kernel_and_same_pad(*kernel_size):
     paddings = tuple(map(lambda k: k // 2, kernel_size))
     return dict(kernel_size = kernel_size, padding = paddings)
 
 class XUnet(nn.Module):
+
+    @beartype
     def __init__(
         self,
         dim,
         init_dim = None,
         out_dim = None,
         frame_kernel_size = 1,
-        dim_mults = (1, 2, 4, 8),
-        num_blocks_per_stage = (2, 2, 2, 2),
-        num_self_attn_per_stage = (0, 0, 0, 1),
-        nested_unet_depths = (0, 0, 0, 0),
+        dim_mults: MaybeTuple(int) = (1, 2, 4, 8),
+        num_blocks_per_stage: MaybeTuple(int) = (2, 2, 2, 2),
+        num_self_attn_per_stage: MaybeTuple(int) = (0, 0, 0, 1),
+        nested_unet_depths: MaybeTuple(int) = (0, 0, 0, 0),
         nested_unet_dim = 32,
         channels = 3,
         use_convnext = False,
@@ -313,8 +321,8 @@ class XUnet(nn.Module):
         consolidate_upsample_fmaps = True,
         skip_scale = 2 ** -0.5,
         weight_standardize = False,
-        attn_heads = 8,
-        attn_dim_head = 32
+        attn_heads: MaybeTuple(int) = 8,
+        attn_dim_head: MaybeTuple(int) = 32
     ):
         super().__init__()
 
@@ -354,10 +362,8 @@ class XUnet(nn.Module):
 
         # attn kwargs
 
-        attn_kwargs = dict(
-            heads = attn_heads,
-            dim_head = attn_dim_head
-        )
+        attn_heads = cast_tuple(attn_heads, num_resolutions)
+        attn_dim_head = cast_tuple(attn_dim_head, num_resolutions)
 
         # modules for all layers
 
@@ -367,21 +373,23 @@ class XUnet(nn.Module):
             in_out,
             nested_unet_depths,
             num_blocks_per_stage,
-            num_self_attn_per_stage
+            num_self_attn_per_stage,
+            attn_heads,
+            attn_dim_head
         ]
 
         up_stage_parameters = [reversed(params[:-1]) for params in down_stage_parameters]
 
         # downs
 
-        for ind, ((dim_in, dim_out), nested_unet_depth, num_blocks, self_attn_blocks) in enumerate(zip(*down_stage_parameters)):
+        for ind, ((dim_in, dim_out), nested_unet_depth, num_blocks, self_attn_blocks, heads, dim_head) in enumerate(zip(*down_stage_parameters)):
             is_last = ind >= (num_resolutions - 1)
             skip_dims.append(dim_in)
 
             self.downs.append(nn.ModuleList([
                 blocks(dim_in, dim_in, nested_unet_depth = nested_unet_depth, nested_unet_dim = nested_unet_dim),
                 nn.ModuleList([blocks(dim_in, dim_in, nested_unet_depth = nested_unet_depth, nested_unet_dim = nested_unet_dim) for _ in range(num_blocks - 1)]),
-                nn.ModuleList([TransformerBlock(dim_in, depth = self_attn_blocks, **attn_kwargs) for _ in range(self_attn_blocks)]),
+                nn.ModuleList([TransformerBlock(dim_in, depth = self_attn_blocks, heads = heads, dim_head = dim_head) for _ in range(self_attn_blocks)]),
                 Downsample(dim_in, dim_out)
             ]))
 
@@ -391,20 +399,20 @@ class XUnet(nn.Module):
         mid_nested_unet_depth = nested_unet_depths[-1]
 
         self.mid = blocks(mid_dim, mid_dim, nested_unet_depth = mid_nested_unet_depth, nested_unet_dim = nested_unet_dim)
-        self.mid_attn = Attention(mid_dim)
+        self.mid_attn = Attention(mid_dim, heads = attn_heads[-1], dim_head = attn_dim_head[-1])
         self.mid_after = blocks(mid_dim, mid_dim, nested_unet_depth = mid_nested_unet_depth, nested_unet_dim = nested_unet_dim)
 
         self.mid_upsample = Upsample(mid_dim, dims[-2])
 
         # ups
 
-        for ind, ((dim_in, dim_out), nested_unet_depth, num_blocks, self_attn_blocks) in enumerate(zip(*up_stage_parameters)):
+        for ind, ((dim_in, dim_out), nested_unet_depth, num_blocks, self_attn_blocks, heads, dim_head) in enumerate(zip(*up_stage_parameters)):
             is_last = ind >= (num_resolutions - 1)
 
             self.ups.append(nn.ModuleList([
                 blocks(dim_out + skip_dims.pop(), dim_out, nested_unet_depth = nested_unet_depth, nested_unet_dim = nested_unet_dim),
                 nn.ModuleList([blocks(dim_out, dim_out, nested_unet_depth = nested_unet_depth, nested_unet_dim = nested_unet_dim) for _ in range(num_blocks - 1)]),
-                nn.ModuleList([TransformerBlock(dim_out, depth = self_attn_blocks, **attn_kwargs) for _ in range(self_attn_blocks)]),
+                nn.ModuleList([TransformerBlock(dim_out, depth = self_attn_blocks, heads = heads, dim_head = dim_head) for _ in range(self_attn_blocks)]),
                 Upsample(dim_out, dim_in) if not is_last else nn.Identity()
             ]))
 

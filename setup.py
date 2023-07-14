@@ -3,7 +3,7 @@ from setuptools import setup, find_packages
 setup(
   name = 'x-unet',
   packages = find_packages(exclude=[]),
-  version = '0.3.0',
+  version = '0.3.1',
   license='MIT',
   description = 'X-Unet',
   long_description_content_type = 'text/markdown',
@@ -18,6 +18,7 @@ setup(
     'unets',
   ],
   install_requires=[
+    'beartype',
     'einops>=0.4',
     'torch>=1.6',
   ],
