@@ -1,0 +1,58 @@
+[project]
+name = "x-unet"
+version = "0.5.0"
+description = "X-Unet"
+authors = [
+    { name = "Phil Wang", email = "lucidrains@gmail.com" }
+]
+readme = "README.md"
+requires-python = ">= 3.9"
+license = { file = "LICENSE" }
+keywords = [
+    "artificial intelligence",
+    "deep learning",
+    "biomedical segmentation",
+    "medical deep learning",
+    "unets",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+]
+dependencies = [
+    "einops>=0.8.0",
+    "torch>=2.5",
+    "torch-einops-utils>=0.1.29",
+]
+
+[project.urls]
+Homepage = "https://github.com/lucidrains/x-unet"
+Repository = "https://github.com/lucidrains/x-unet"
+
+[project.optional-dependencies]
+test = [
+    "pytest"
+]
+
+[tool.pytest.ini_options]
+pythonpath = [
+    "."
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["x_unet"]
+
+[tool.hatch.build]
+include = [
+    "x_unet",
+    "pyproject.toml",
+    "README.md",
+    "LICENSE",
+]

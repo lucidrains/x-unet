@@ -1,15 +1,15 @@
+from __future__ import annotations
 from functools import partial
 
-import math
 import torch
-from torch import nn, einsum
+from torch import einsum, nn
+from torch.nn import Module, ModuleList
 import torch.nn.functional as F
 
 from einops import rearrange, repeat, reduce
 from einops.layers.torch import Rearrange
 
-from beartype import beartype
-from beartype.typing import Tuple, Union, Optional
+from torch_einops_utils import safe_cat, tree_map_tensor
 
 # helper functions
 
@@ -18,9 +18,6 @@ def exists(val):
 
 def default(val, d):
     return val if exists(val) else d
-
-def is_power_two(n):
-    return math.log2(n).is_integer()
 
 def divisible_by(num, denom):
     return (num % denom) == 0
@@ -49,24 +46,16 @@ def Downsample(dim, dim_out):
 
 # normalization
 
-class Residual(nn.Module):
-    def __init__(self, fn):
-        super().__init__()
-        self.fn = fn
-
-    def forward(self, x):
-        return self.fn(x) + x
-
-class RMSNorm(nn.Module):
+class RMSNorm(Module):
     def __init__(self, dim):
         super().__init__()
         self.scale = dim ** 0.5
-        self.gamma = nn.Parameter(torch.ones(dim, 1, 1, 1))
+        self.gamma = nn.Parameter(torch.ones(dim))
 
     def forward(self, x):
-        return F.normalize(x, dim = 1) * self.scale * self.gamma
+        return einsum('b c ..., c -> b c ...', F.normalize(x, dim = 1) * self.scale, self.gamma)
 
-class LayerNorm(nn.Module):
+class LayerNorm(Module):
     def __init__(self, dim):
         super().__init__()
         self.gamma = nn.Parameter(torch.ones(1, dim, 1, 1, 1))
@@ -91,7 +80,7 @@ class WeightStandardizedConv3d(nn.Conv3d):
 
 # resnet blocks
 
-class Block(nn.Module):
+class Block(Module):
     def __init__(
         self,
         dim,
@@ -113,7 +102,7 @@ class Block(nn.Module):
         x = self.norm(x)
         return self.act(x)
 
-class ResnetBlock(nn.Module):
+class ResnetBlock(Module):
     def __init__(
         self,
         dim,
@@ -124,12 +113,29 @@ class ResnetBlock(nn.Module):
         weight_standardize = False
     ):
         super().__init__()
-        self.block1 = Block(dim, dim_out, weight_standardize = weight_standardize, frame_kernel_size = frame_kernel_size)
+        self.block1 = Block(
+            dim,
+            dim_out,
+            weight_standardize = weight_standardize,
+            frame_kernel_size = frame_kernel_size
+        )
 
         if nested_unet_depth > 0:
-            self.block2 = NestedResidualUnet(dim_out, depth = nested_unet_depth, M = nested_unet_dim, frame_kernel_size = frame_kernel_size, weight_standardize = weight_standardize, add_residual = True)
+            self.block2 = NestedResidualUnet(
+                dim_out,
+                depth = nested_unet_depth,
+                dim_inner = nested_unet_dim,
+                frame_kernel_size = frame_kernel_size,
+                weight_standardize = weight_standardize,
+                add_residual = True
+            )
         else:
-            self.block2 = Block(dim_out, dim_out, weight_standardize = weight_standardize, frame_kernel_size = frame_kernel_size)
+            self.block2 = Block(
+                dim_out,
+                dim_out,
+                weight_standardize = weight_standardize,
+                frame_kernel_size = frame_kernel_size
+            )
 
         self.res_conv = nn.Conv3d(dim, dim_out, 1) if dim != dim_out else nn.Identity()
 
@@ -140,7 +146,7 @@ class ResnetBlock(nn.Module):
 
 # convnext 2
 
-class GRN(nn.Module):
+class GRN(Module):
     """ global response normalization, proposed in updated convnext paper """
 
     def __init__(self, dim, eps = 1e-5):
@@ -154,7 +160,7 @@ class GRN(nn.Module):
         feat_norm = spatial_l2_norm / spatial_l2_norm.mean(dim = -1, keepdim = True).clamp(min = self.eps)
         return x * feat_norm * self.gamma + self.bias + x
 
-class ConvNextBlock(nn.Module):
+class ConvNextBlock(Module):
     def __init__(
         self,
         dim,
@@ -180,7 +186,15 @@ class ConvNextBlock(nn.Module):
             nn.Conv3d(inner_dim, dim_out, **kernel_conv_kwargs(3, 3), groups = dim_out)
         )
 
-        self.nested_unet = NestedResidualUnet(dim_out, depth = nested_unet_depth, M = nested_unet_dim, add_residual = True) if nested_unet_depth > 0 else nn.Identity()
+        self.nested_unet = nn.Identity()
+
+        if nested_unet_depth > 0:
+            self.nested_unet = NestedResidualUnet(
+                dim_out,
+                depth = nested_unet_depth,
+                dim_inner = nested_unet_dim,
+                add_residual = True
+            )
 
         self.res_conv = nn.Conv3d(dim, dim_out, 1) if dim != dim_out else nn.Identity()
 
@@ -194,17 +208,17 @@ class ConvNextBlock(nn.Module):
 
 def FeedForward(dim, mult = 4.):
     inner_dim = int(dim * mult)
-    return Residual(nn.Sequential(
+    return nn.Sequential(
         LayerNorm(dim),
         nn.Conv3d(dim, inner_dim, 1, bias = False),
         nn.GELU(),
         LayerNorm(inner_dim),   # properly credit assign normformer
         nn.Conv3d(inner_dim, dim, 1, bias = False)
-    ))
+    )
 
 # attention
 
-class Attention(nn.Module):
+class Attention(Module):
     def __init__(
         self,
         dim,
@@ -223,8 +237,6 @@ class Attention(nn.Module):
     def forward(self, x):
         f, h, w = x.shape[-3:]
 
-        residual = x.clone()
-
         x = self.norm(x)
 
         q, k, v = self.to_qkv(x).chunk(3, dim = 1)
@@ -237,9 +249,9 @@ class Attention(nn.Module):
         out = einsum('b h i j, b h j d -> b h i d', attn, v)
 
         out = rearrange(out, 'b h (f x y) d -> b (h d) f x y', f = f, x = h, y = w)
-        return self.to_out(out) + residual
+        return self.to_out(out)
 
-class TransformerBlock(nn.Module):
+class TransformerBlock(Module):
     def __init__(
         self,
         dim,
@@ -249,14 +261,14 @@ class TransformerBlock(nn.Module):
     ):
         super().__init__()
         self.attn = Attention(dim, **kwargs)
-        self.ff =FeedForward(dim)
+        self.ff = FeedForward(dim)
 
     def forward(self, x):
-        x = self.attn(x)
-        x = self.ff(x)
+        x = self.attn(x) + x
+        x = self.ff(x) + x
         return x
 
-class FeatureMapConsolidator(nn.Module):
+class FeatureMapConsolidator(Module):
     def __init__(
         self,
         dim,
@@ -268,14 +280,13 @@ class FeatureMapConsolidator(nn.Module):
     ):
         super().__init__()
         assert len(dim_ins) == len(dim_outs)
-        self.needs_consolidating = len(dim_ins) > 0
 
         block_fn = default(conv_block_fn, Block)
 
-        self.fmap_convs = nn.ModuleList([block_fn(dim_in, dim_out) for dim_in, dim_out in zip(dim_ins, dim_outs)])
+        self.fmap_convs = ModuleList([block_fn(dim_in, dim_out) for dim_in, dim_out in zip(dim_ins, dim_outs)])
         self.resize_fmap_before = resize_fmap_before
 
-        self.final_dim_out = dim + (sum(dim_outs) if len(dim_outs) > 0 else 0)
+        self.final_dim_out = dim + sum(dim_outs)
 
     def resize_fmaps(self, fmaps, height, width):
         return [F.interpolate(fmap, (fmap.shape[-3], height, width)) for fmap in fmaps]
@@ -285,51 +296,167 @@ class FeatureMapConsolidator(nn.Module):
 
         fmaps = default(fmaps, tuple())
 
-        if not self.needs_consolidating:
-            return x
-
         if self.resize_fmap_before:
             fmaps = self.resize_fmaps(fmaps, target_height, target_width)
 
-        outs = []
-        for fmap, conv in zip(fmaps, self.fmap_convs):
-            outs.append(conv(fmap))
+        outs = [conv(fmap) for fmap, conv in zip(fmaps, self.fmap_convs)]
 
-        if self.resize_fmap_before:
+        if not self.resize_fmap_before:
             outs = self.resize_fmaps(outs, target_height, target_width)
 
-        return torch.cat((x, *outs), dim = 1)
+        return safe_cat((x, *outs), dim = 1)
+
+# attention residuals (xattnres)
+
+def resize_to(x, shape, pooling = 'max'):
+    spatial_shape = x.shape[2:]
+
+    if spatial_shape == shape:
+        return x
+
+    dim = len(shape)
+    is_down = all(s >= t for s, t in zip(spatial_shape, shape))
+
+    if is_down:
+        return getattr(F, f'adaptive_{pooling}_pool{dim}d')(x, shape)
+
+    mode = ('linear', 'bilinear', 'trilinear')[dim - 1]
+    return F.interpolate(x, shape, mode = mode, align_corners = False)
+
+# projection and lora
+
+class Project(Module):
+    def __init__(
+        self,
+        dim_in,
+        dim_out
+    ):
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(dim_out, dim_in) * (dim_in ** -0.5))
+
+    def forward(self, x):
+        return einsum('b c ..., d c -> b d ...', x, self.weight)
+
+class LoRA(Module):
+    def __init__(
+        self,
+        dim_in,
+        dim_out,
+        dim_lora = 8
+    ):
+        super().__init__()
+        self.down = nn.Parameter(torch.randn(dim_lora, dim_in) * (dim_in ** -0.5))
+        self.up = nn.Parameter(torch.zeros(dim_out, dim_lora))
+
+    def forward(self, x):
+        lora = einsum('b c ..., l c -> b l ...', x, self.down)
+        return einsum('b l ..., d l -> b d ...', lora, self.up)
+
+class XAttnRes(Module):
+    def __init__(
+        self,
+        dim: int,
+        *,
+        dim_ins: tuple[int, ...] | None = None,
+        heads: int = 1,
+        pooling: str = 'max',
+        dim_lora: int | None = 8,
+        channel_first: bool = True
+    ):
+        super().__init__()
+        assert divisible_by(dim, heads), f'dimension {dim} must be divisible by heads {heads}'
+
+        self.scale = (dim // heads) ** -0.5
+        self.heads = heads
+        self.pooling = pooling
+        self.channel_first = channel_first
+
+        dim_ins = default(dim_ins, ())
+        self.projs = ModuleList([Project(d, dim) if d != dim else nn.Identity() for d in dim_ins])
+
+        self.has_lora = exists(dim_lora) and dim_lora > 0
+        if self.has_lora:
+            self.norms_in = ModuleList([RMSNorm(d) for d in dim_ins])
+            self.loras = ModuleList([LoRA(d, dim, dim_lora = dim_lora) for d in dim_ins])
+
+        self.norm = RMSNorm(dim)
+        self.pseudo_query = nn.Parameter(torch.zeros(heads, dim // heads))
+
+    def forward(self, x, history = None):
+        if not exists(history) or len(history) == 0:
+            return x
+
+        if not self.channel_first:
+            x = rearrange(x, 'b ... c -> b c ...')
+            history = tree_map_tensor(lambda t: rearrange(t, 'b ... c -> b c ...'), history)
+
+        assert len(history) == len(self.projs), f'history must have {len(self.projs)} entries, but received {len(history)}'
+
+        spatial_shape = x.shape[2:]
+
+        values, keys = [], []
+
+        for ind, h in enumerate(history):
+            h = resize_to(h, spatial_shape, pooling = self.pooling)
+
+            value = self.projs[ind](h)
+            values.append(value)
+
+            key = value
+            if self.has_lora:
+                key = key + self.loras[ind](self.norms_in[ind](h))
+
+            keys.append(self.norm(key))
+
+        values.append(x)
+        keys.append(self.norm(x))
+
+        values = rearrange(values, 'n b (h d) ... -> b n h d ...', h = self.heads)
+        keys = rearrange(keys, 'n b (h d) ... -> b n h d ...', h = self.heads)
+
+        logits = einsum('b n h d ..., h d -> b n h ...', keys, self.pseudo_query) * self.scale
+        attn = logits.softmax(dim = 1)
+
+        out = einsum('b n h ..., b n h d ... -> b h d ...', attn, values)
+        out = rearrange(out, 'b h d ... -> b (h d) ...')
+
+        if not self.channel_first:
+            out = rearrange(out, 'b c ... -> b ... c')
+
+        return out
 
 # unet
-
-def MaybeTuple(type):
-    return Union[type, Tuple[type, ...]]
 
 def kernel_and_same_pad(*kernel_size):
     paddings = tuple(map(lambda k: k // 2, kernel_size))
     return dict(kernel_size = kernel_size, padding = paddings)
 
-class XUnet(nn.Module):
+class XUnet(Module):
 
-    @beartype
     def __init__(
         self,
         dim,
         init_dim = None,
         out_dim = None,
         frame_kernel_size = 1,
-        dim_mults: MaybeTuple(int) = (1, 2, 4, 8),
-        num_blocks_per_stage: MaybeTuple(int) = (2, 2, 2, 2),
-        num_self_attn_per_stage: MaybeTuple(int) = (0, 0, 0, 1),
-        nested_unet_depths: MaybeTuple(int) = (0, 0, 0, 0),
+        dim_mults: tuple[int, ...] = (1, 2, 4, 8),
+        num_blocks_per_stage: tuple[int, ...] = (2, 2, 2, 2),
+        num_self_attn_per_stage: tuple[int, ...] = (0, 0, 0, 1),
+        nested_unet_depths: tuple[int, ...] = (0, 0, 0, 0),
         nested_unet_dim = 32,
         channels = 3,
         use_convnext = False,
         consolidate_upsample_fmaps = True,
         skip_scale = 2 ** -0.5,
         weight_standardize = False,
-        attn_heads: MaybeTuple(int) = 8,
-        attn_dim_head: MaybeTuple(int) = 32
+        attn_heads: int | tuple[int, ...] = 8,
+        attn_dim_head: int | tuple[int, ...] = 32,
+        use_xattnres = False,
+        xattnres_replace_skips = False,
+        xattnres_heads = 1,
+        xattnres_pooling = 'max',
+        xattnres_dim_lora: int | None = 8,
+        xattnres_kwargs: dict | None = None
     ):
         super().__init__()
 
@@ -344,14 +471,21 @@ class XUnet(nn.Module):
         dims = [init_dim, *map(lambda m: dim * m, dim_mults)]
         in_out = list(zip(dims[:-1], dims[1:]))
 
-        self.downs = nn.ModuleList([])
-        self.ups = nn.ModuleList([])
+        self.downs = ModuleList([])
+        self.ups = ModuleList([])
 
         num_resolutions = len(in_out)
 
         # resnet or convnext
 
-        blocks = partial(ConvNextBlock, frame_kernel_size = frame_kernel_size) if use_convnext else partial(ResnetBlock, weight_standardize = weight_standardize, frame_kernel_size = frame_kernel_size)
+        if use_convnext:
+            blocks = partial(ConvNextBlock, frame_kernel_size = frame_kernel_size)
+        else:
+            blocks = partial(
+                ResnetBlock,
+                weight_standardize = weight_standardize,
+                frame_kernel_size = frame_kernel_size
+            )
 
         # whether to use nested unet, as in unet squared paper
 
@@ -387,16 +521,88 @@ class XUnet(nn.Module):
 
         up_stage_parameters = [reversed(params[:-1]) for params in down_stage_parameters]
 
+        # xattnres setup
+
+        assert not (xattnres_replace_skips and not use_xattnres), 'xattnres_replace_skips can only be True if use_xattnres is also True'
+
+        self.use_xattnres = use_xattnres
+        self.xattnres_replace_skips = xattnres_replace_skips
+
+        self.down_xattnres = None
+        self.mid_xattnres = None
+        self.up_xattnres = None
+
+        if use_xattnres:
+            xattnres_kwargs = dict(
+                heads = xattnres_heads,
+                pooling = xattnres_pooling,
+                dim_lora = xattnres_dim_lora,
+                **default(xattnres_kwargs, {})
+            )
+
+            self.down_xattnres = ModuleList([])
+            self.up_xattnres = ModuleList([])
+            history_dims = []
+
+            for dim_in, _ in in_out:
+                self.down_xattnres.append(
+                    XAttnRes(
+                        dim_in,
+                        dim_ins = tuple(history_dims),
+                        **xattnres_kwargs
+                    )
+                )
+                history_dims.append(dim_in)
+
+            mid_dim = dims[-1]
+            self.mid_xattnres = XAttnRes(
+                mid_dim,
+                dim_ins = tuple(history_dims),
+                **xattnres_kwargs
+            )
+            history_dims.append(mid_dim)
+
+            for _, dim_out in reversed(in_out[:-1]):
+                self.up_xattnres.append(
+                    XAttnRes(
+                        dim_out,
+                        dim_ins = tuple(history_dims),
+                        **xattnres_kwargs
+                    )
+                )
+                history_dims.append(dim_out)
+
         # downs
 
         for ind, ((dim_in, dim_out), nested_unet_depth, num_blocks, self_attn_blocks, heads, dim_head) in enumerate(zip(*down_stage_parameters)):
             is_last = ind >= (num_resolutions - 1)
             skip_dims.append(dim_in)
 
-            self.downs.append(nn.ModuleList([
-                blocks(dim_in, dim_in, nested_unet_depth = nested_unet_depth, nested_unet_dim = nested_unet_dim),
-                nn.ModuleList([blocks(dim_in, dim_in, nested_unet_depth = nested_unet_depth, nested_unet_dim = nested_unet_dim) for _ in range(num_blocks - 1)]),
-                nn.ModuleList([TransformerBlock(dim_in, depth = self_attn_blocks, heads = heads, dim_head = dim_head) for _ in range(self_attn_blocks)]),
+            self.downs.append(ModuleList([
+                blocks(
+                    dim_in,
+                    dim_in,
+                    nested_unet_depth = nested_unet_depth,
+                    nested_unet_dim = nested_unet_dim
+                ),
+                ModuleList([
+                    blocks(
+                        dim_in,
+                        dim_in,
+                        nested_unet_depth = nested_unet_depth,
+                        nested_unet_dim = nested_unet_dim
+                    )
+                    for _ in range(num_blocks - 1)
+                ]),
+                ModuleList([
+                    TransformerBlock(
+                        dim_in,
+                        depth = self_attn_blocks,
+                        heads = heads,
+                        dim_head = dim_head
+                    )
+                    for _ in range(self_attn_blocks)
+                ]),
                 Downsample(dim_in, dim_out)
             ]))
 
@@ -405,9 +611,23 @@ class XUnet(nn.Module):
         mid_dim = dims[-1]
         mid_nested_unet_depth = nested_unet_depths[-1]
 
-        self.mid = blocks(mid_dim, mid_dim, nested_unet_depth = mid_nested_unet_depth, nested_unet_dim = nested_unet_dim)
-        self.mid_attn = Attention(mid_dim, heads = attn_heads[-1], dim_head = attn_dim_head[-1])
-        self.mid_after = blocks(mid_dim, mid_dim, nested_unet_depth = mid_nested_unet_depth, nested_unet_dim = nested_unet_dim)
+        self.mid = blocks(
+            mid_dim,
+            mid_dim,
+            nested_unet_depth = mid_nested_unet_depth,
+            nested_unet_dim = nested_unet_dim
+        )
+        self.mid_attn = Attention(
+            mid_dim,
+            heads = attn_heads[-1],
+            dim_head = attn_dim_head[-1]
+        )
+        self.mid_after = blocks(
+            mid_dim,
+            mid_dim,
+            nested_unet_depth = mid_nested_unet_depth,
+            nested_unet_dim = nested_unet_dim
+        )
 
         self.mid_upsample = Upsample(mid_dim, dims[-2])
 
@@ -415,11 +635,33 @@ class XUnet(nn.Module):
 
         for ind, ((dim_in, dim_out), nested_unet_depth, num_blocks, self_attn_blocks, heads, dim_head) in enumerate(zip(*up_stage_parameters)):
             is_last = ind >= (num_resolutions - 1)
+            skip_dim = 0 if xattnres_replace_skips else skip_dims.pop()
 
-            self.ups.append(nn.ModuleList([
-                blocks(dim_out + skip_dims.pop(), dim_out, nested_unet_depth = nested_unet_depth, nested_unet_dim = nested_unet_dim),
-                nn.ModuleList([blocks(dim_out, dim_out, nested_unet_depth = nested_unet_depth, nested_unet_dim = nested_unet_dim) for _ in range(num_blocks - 1)]),
-                nn.ModuleList([TransformerBlock(dim_out, depth = self_attn_blocks, heads = heads, dim_head = dim_head) for _ in range(self_attn_blocks)]),
+            self.ups.append(ModuleList([
+                blocks(
+                    dim_out + skip_dim,
+                    dim_out,
+                    nested_unet_depth = nested_unet_depth,
+                    nested_unet_dim = nested_unet_dim
+                ),
+                ModuleList([
+                    blocks(
+                        dim_out,
+                        dim_out,
+                        nested_unet_depth = nested_unet_depth,
+                        nested_unet_dim = nested_unet_dim
+                    )
+                    for _ in range(num_blocks - 1)
+                ]),
+                ModuleList([
+                    TransformerBlock(
+                        dim_out,
+                        depth = self_attn_blocks,
+                        heads = heads,
+                        dim_head = dim_head
+                    )
+                    for _ in range(self_attn_blocks)
+                ]),
                 Upsample(dim_out, dim_in) if not is_last else nn.Identity()
             ]))
 
@@ -468,8 +710,12 @@ class XUnet(nn.Module):
 
         down_hiddens = []
         up_hiddens = []
+        history = []
 
-        for init_block, blocks, attn_blocks, downsample in self.downs:
+        for ind, (init_block, blocks, attn_blocks, downsample) in enumerate(self.downs):
+            if self.use_xattnres:
+                x = self.down_xattnres[ind](x, history)
+
             x = init_block(x)
 
             for block in blocks:
@@ -478,19 +724,31 @@ class XUnet(nn.Module):
             for attn_block in attn_blocks:
                 x = attn_block(x)
 
+            if self.use_xattnres:
+                history.append(x)
+
             down_hiddens.append(x)
             x = downsample(x)
+
+        if self.use_xattnres:
+            x = self.mid_xattnres(x, history)
 
         x = self.mid(x)
         x = self.mid_attn(x) + x
         x = self.mid_after(x)
 
+        if self.use_xattnres:
+            history.append(x)
+
         up_hiddens.append(x)
         x = self.mid_upsample(x)
 
+        for ind, (init_block, blocks, attn_blocks, upsample) in enumerate(self.ups):
+            if self.use_xattnres:
+                x = self.up_xattnres[ind](x, history)
 
-        for init_block, blocks, attn_blocks, upsample in self.ups:
-            x = torch.cat((x, down_hiddens.pop() * self.skip_scale), dim=1)
+            if not self.xattnres_replace_skips:
+                x = torch.cat((x, down_hiddens.pop() * self.skip_scale), dim=1)
 
             x = init_block(x)
 
@@ -499,6 +757,9 @@ class XUnet(nn.Module):
 
             for attn_block in attn_blocks:
                 x = attn_block(x)
+
+            if self.use_xattnres:
+                history.append(x)
 
             up_hiddens.insert(0, x)
             x = upsample(x)
@@ -522,7 +783,7 @@ class XUnet(nn.Module):
 
 # RSU
 
-class PixelShuffleUpsample(nn.Module):
+class PixelShuffleUpsample(Module):
     def __init__(
         self,
         dim,
@@ -555,13 +816,13 @@ class PixelShuffleUpsample(nn.Module):
         x = self.net(x)
         return x
 
-class NestedResidualUnet(nn.Module):
+class NestedResidualUnet(Module):
     def __init__(
         self,
         dim,
         *,
         depth,
-        M = 32,
+        dim_inner = 32,
         frame_kernel_size = 1,
         add_residual = False,
         skip_scale = 2 ** -0.5,
@@ -570,23 +831,29 @@ class NestedResidualUnet(nn.Module):
         super().__init__()
 
         self.depth = depth
-        self.downs = nn.ModuleList([])
-        self.ups = nn.ModuleList([])
+        self.downs = ModuleList([])
+        self.ups = ModuleList([])
 
         conv = WeightStandardizedConv3d if weight_standardize else nn.Conv3d
 
         for ind in range(depth):
             is_first = ind == 0
-            dim_in = dim if is_first else M
+            dim_in = dim if is_first else dim_inner
 
             down = nn.Sequential(
-                conv(dim_in, M, (1, 4, 4), stride = (1, 2, 2), padding = (0, 1, 1)),
-                RMSNorm(M),
+                conv(
+                    dim_in,
+                    dim_inner,
+                    (1, 4, 4),
+                    stride = (1, 2, 2),
+                    padding = (0, 1, 1)
+                ),
+                RMSNorm(dim_inner),
                 nn.SiLU()
             )
 
             up = nn.Sequential(
-                PixelShuffleUpsample(2 * M, dim_in),
+                PixelShuffleUpsample(2 * dim_inner, dim_in),
                 RMSNorm(dim_in),
                 nn.SiLU()
             )
@@ -595,8 +862,8 @@ class NestedResidualUnet(nn.Module):
             self.ups.append(up)
 
         self.mid = nn.Sequential(
-            conv(M, M, **kernel_and_same_pad(frame_kernel_size, 3, 3)),
-            RMSNorm(M),
+            conv(dim_inner, dim_inner, **kernel_and_same_pad(frame_kernel_size, 3, 3)),
+            RMSNorm(dim_inner),
             nn.SiLU()
         )
 
@@ -604,8 +871,6 @@ class NestedResidualUnet(nn.Module):
         self.add_residual = add_residual
 
     def forward(self, x, residual = None):
-        is_video = x.ndim == 5
-
         if self.add_residual:
             residual = default(residual, x.clone())
 
